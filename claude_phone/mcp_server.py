@@ -1,5 +1,6 @@
 """stdio MCP server exposing call_<owner>, notify_<owner> and transfer_call. One instance per Claude Code session; Claude Code passes
-CLAUDE_CODE_SESSION_ID and ITERM_SESSION_ID in the env, which identify the calling session."""
+CLAUDE_CODE_SESSION_ID and ITERM_SESSION_ID in the env, which identify the calling session. On a client install
+(remote_url set) it calls the Mac's daemon over the LAN instead."""
 
 from __future__ import annotations
 
@@ -8,26 +9,28 @@ import os
 import aiohttp
 from mcp.server.mcpserver import MCPServer
 
-from . import config
+from . import config, remote
 from .hooks import iterm_unique_id
 
 mcp = MCPServer("claude-phone")
 
 
 def _body(**kw) -> dict:
-    return {
-        **kw,
-        "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID"),
-        "iterm_id": iterm_unique_id(),
-        "cwd": os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd(),
-    }
+    cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    body = {**kw, "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID"), "iterm_id": iterm_unique_id(), "cwd": cwd}
+    if config.load().remote_url:
+        body.update(remote.caller_fields(cwd))
+    return body
 
 
 async def _post(path: str, body: dict) -> dict:
     s = config.load()
+    headers = remote.headers() if s.remote_url else {}
     async with aiohttp.ClientSession() as http:
         # Ring 25 s + answer 60 s + transcription stays under Claude Code's 120 s auto-background.
-        async with http.post(f"{s.daemon_url}{path}", json=body, timeout=aiohttp.ClientTimeout(total=115)) as r:
+        async with http.post(f"{s.daemon_url}{path}", json=body, headers=headers,
+                             timeout=aiohttp.ClientTimeout(total=115)) as r:
+            r.raise_for_status()
             return await r.json()
 
 

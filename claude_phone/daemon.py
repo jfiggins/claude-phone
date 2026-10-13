@@ -1,8 +1,10 @@
-"""Controller daemon: owns every call. Talks to Asterisk over ARI and serves call_<owner> on localhost."""
+"""Controller daemon: owns every call. Talks to Asterisk over ARI and serves call_<owner> on localhost,
+and to sessions on other computers on the LAN when remote_listen is on."""
 
 from __future__ import annotations
 
 import asyncio
+import hmac
 import os
 import re
 import time
@@ -13,14 +15,17 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import config, diary, hold, housekeeping, inject, keychain, log, push, registry, safe, screen, stt, tts
+from . import config, diary, hold, housekeeping, inject, keychain, log, push, registry, remote, safe, screen, stt, tts
 from .ari import ARI, Call, Hangup
 
 lg = log.get("daemon")
 
 MAILBOX = "owner@claude"
+REMOTE_APP = web.AppKey("remote_app", bool)  # set on the LAN listener's app, whose requests come from other computers
 VOICEMAIL_MESSAGE = ("{owner} didn't answer. A voicemail has been left. Carry on with other work or your best "
                      "assumption; the answer will arrive later as a new message in this session.")
+REMOTE_VOICEMAIL_MESSAGE = ("{owner} didn't answer. A voicemail has been left. Carry on with other work or your best "
+                            "assumption; the answer will arrive in this session when a turn ends or {owner} next types.")
 ANSWER_PREFIX = "[Phone answer to your earlier question]"
 ALLHANDS_PREFIX = "[All-hands message from {owner}, sent to every session]"
 # Claude Code's spinner line while a turn runs, e.g. "· Generating… (1m 51s · ↓ 4.3k tokens)".
@@ -497,6 +502,8 @@ class Controller:
     def caller(self, body: dict) -> dict:
         """Who is calling: the registered session, registering it if its tab predates the hooks."""
         agent = (body.get("from_agent") or "").strip() or None
+        if body.get("remote"):
+            return self.remote_caller(body, agent)
         sess = registry.find(body.get("session_id"), body.get("iterm_id"))
         if not sess and body.get("session_id") and body.get("iterm_id"):
             from .hooks import repo_info
@@ -517,7 +524,20 @@ class Controller:
         intro = tts.spoken_label(f"{repo}/{branch}" if branch and branch not in ("main", "master") else repo)
         if agent:
             label, intro = f"{label}@{agent}", f"{intro}, {agent}"
-        return {"label": label, "ext": ext, "sid": sid, "repo": repo, "intro": intro}
+        return {"label": label, "ext": ext, "sid": sid, "repo": repo, "intro": intro, "host": None}
+
+    @staticmethod
+    def remote_caller(body: dict, agent: str | None) -> dict:
+        """A session on another computer. It has no extension and nothing can be typed into it, so it is
+        never registered: it can't be dialled, rung by all-hands or transferred to."""
+        repo = (body.get("repo") or "remote").strip()
+        branch = body.get("worktree") or body.get("branch")
+        label = f"{repo}/{branch}" if branch else repo
+        intro = tts.spoken_label(f"{repo}/{branch}" if branch and branch not in ("main", "master") else repo)
+        if agent:
+            label, intro = f"{label}@{agent}", f"{intro}, {agent}"
+        return {"label": label, "ext": None, "sid": body.get("session_id") or "", "repo": repo, "intro": intro,
+                "host": body.get("host") or "remote"}
 
     async def ring(self, c: dict, prefix: str, auto_answer: bool = False) -> tuple[Call | None, str]:
         """Ring the desk phone. Returns (answered call, '') or (None, why not). Caller holds self.line.
@@ -566,12 +586,14 @@ class Controller:
 
         async def to_voicemail(reason: str) -> dict:
             audio = await speech
-            registry.add_voicemail(sid, ext, label, f"{context} {question}" if context else question, context, audio)
+            registry.add_voicemail(sid, ext, label, f"{context} {question}" if context else question, context, audio,
+                                   host=c["host"])
             await self.update_mwi()
             lg.info("voicemail left by %s (%s)", label, reason)
             if reason not in PUSH_SKIP:
                 push.missed("Missed call", label, question, reason)
-            return {"status": "voicemail", "reason": reason, "message": VOICEMAIL_MESSAGE.format(owner=self.s.owner)}
+            message = REMOTE_VOICEMAIL_MESSAGE if c["host"] else VOICEMAIL_MESSAGE
+            return {"status": "voicemail", "reason": reason, "message": message.format(owner=self.s.owner)}
 
         if not question:
             speech.cancel()
@@ -767,22 +789,73 @@ class Controller:
         if call.up and not registry.pending_voicemails():
             await call.play(tts.phrase("vm_done"))
 
+    @staticmethod
+    def answer_text(vm: registry.Voicemail) -> str:
+        q = vm.question if len(vm.question) <= 160 else vm.question[:157] + "..."
+        return f'{ANSWER_PREFIX} {vm.answer} (Your question was: "{q}")'
+
     async def deliver_answer(self, vm: registry.Voicemail, answer: str) -> bool:
+        if vm.host:
+            # Nothing can be typed on another computer: its hooks collect the answer (POST /answers).
+            registry.answer_voicemail(vm.id, answer, registry.REMOTE_PENDING)
+            lg.info("voicemail %s answered; waiting for %s to collect it", vm.id, vm.host)
+            return True
         sess = registry.find(vm.session_id)
         if not sess:
             registry.answer_voicemail(vm.id, answer, "session-ended")
             lg.info("voicemail %s answered but session ended; kept: %r", vm.id, answer)
             return False
-        q = vm.question if len(vm.question) <= 160 else vm.question[:157] + "..."
-        text = f'{ANSWER_PREFIX} {answer} (Your question was: "{q}")'
+        vm.answer = answer
+        text = self.answer_text(vm)
         result = await asyncio.to_thread(inject.type_into, sess, text, f"voicemail {vm.id}")
         registry.answer_voicemail(vm.id, answer, "sent" if result == "sent" else f"failed:{result}")
         return result == "sent"
 
-    # --- HTTP (localhost) ---
+    # --- HTTP (localhost, and the LAN for remote clients) ---
+
+    @staticmethod
+    async def body(request: web.Request) -> dict:
+        body = await request.json()
+        if not isinstance(body, dict):
+            raise web.HTTPBadRequest(text="expected a JSON object")
+        if request.app.get(REMOTE_APP):
+            # Internal switches (_force_voicemail) and iTerm ids mean nothing from another computer.
+            body = {k: v for k, v in body.items() if not k.startswith("_") and k != "iterm_id"}
+            body["remote"] = True
+        return body
+
+    @web.middleware
+    async def remote_guard(self, request: web.Request, handler):
+        """The LAN listener: addresses in remote_cidr only, and the shared token on every request."""
+        if ip_address(request.remote or "0.0.0.0") not in ip_network(self.s.remote_cidr or self.s.lan_cidr):
+            raise web.HTTPForbidden()
+        expected = f"Bearer {keychain.get_or_create(remote.TOKEN, 24)}".encode()
+        if not hmac.compare_digest(request.headers.get("Authorization", "").encode(), expected):
+            lg.warning("remote %s %s refused: bad token", request.remote, request.path)
+            raise web.HTTPUnauthorized()
+        return await handler(request)
+
+    def remote_app(self) -> web.Application:
+        """What sessions on other computers may use: ring the owner, transfer, and collect answers."""
+        app = web.Application(middlewares=[self.remote_guard])
+        app[REMOTE_APP] = True
+        app.router.add_post("/call", self.http_call)
+        app.router.add_post("/notify", self.http_notify)
+        app.router.add_post("/transfer", self.http_transfer)
+        app.router.add_post("/answers", self.http_answers)
+        app.router.add_get("/health", self.http_health)
+        return app
+
+    async def http_answers(self, request: web.Request) -> web.Response:
+        """A remote session's hooks collect voicemail answers left for it."""
+        sid = (await self.body(request)).get("session_id")
+        items = registry.take_remote_answers(sid) if sid else []
+        if items:
+            lg.info("remote %s collected answers %s", request.remote, [v.id for v in items])
+        return web.json_response({"answers": [self.answer_text(v) for v in items]})
 
     async def http_transfer(self, request: web.Request) -> web.Response:
-        body = await request.json()
+        body = await self.body(request)
         try:
             return web.json_response(await self.transfer(body))
         except Exception as e:
@@ -801,7 +874,7 @@ class Controller:
         await screen.show(body["_label"], text, timeout=600)
 
     async def http_notify(self, request: web.Request) -> web.Response:
-        body = await request.json()
+        body = await self.body(request)
         try:
             res = await self.notify_owner(body)
             asyncio.create_task(self.show_on_screen(body, body.get("message"), res))
@@ -811,7 +884,7 @@ class Controller:
             return web.json_response({"status": "not_delivered", "reason": f"error: {e.__class__.__name__}"})
 
     async def http_call(self, request: web.Request) -> web.Response:
-        body = await request.json()
+        body = await self.body(request)
         try:
             res = await self.call_owner(body)
             asyncio.create_task(self.show_on_screen(body, body.get("question"), res))
@@ -878,17 +951,21 @@ async def main() -> None:
     book_runner = web.AppRunner(book)
     await book_runner.setup()
     lg.info("daemon up on 127.0.0.1:%s, ringing PJSIP/%s", c.s.daemon_port, c.s.ring_ext)
-    asyncio.create_task(serve_phonebook(book_runner, c.s))
+    asyncio.create_task(serve_on_lan(book_runner, c.s.lan_ip, c.s.phonebook_port, "phonebook"))
+    if c.s.remote_listen:
+        far_runner = web.AppRunner(c.remote_app())
+        await far_runner.setup()
+        asyncio.create_task(serve_on_lan(far_runner, c.s.remote_bind or c.s.lan_ip, c.s.remote_port, "remote clients"))
     await asyncio.Event().wait()
 
 
-async def serve_phonebook(runner: web.AppRunner, s: config.Settings) -> None:
-    """The phonebook binds to the home LAN address, which is missing while the Mac is on another network.
+async def serve_on_lan(runner: web.AppRunner, ip: str, port: int, what: str) -> None:
+    """LAN listeners bind to the home LAN address, which is missing while the Mac is on another network.
     Keep retrying rather than taking the daemon (and missed-call pushes) down with it."""
     while True:
         try:
-            await web.TCPSite(runner, s.lan_ip, s.phonebook_port).start()
-            lg.info("phonebook on %s:%s", s.lan_ip, s.phonebook_port)
+            await web.TCPSite(runner, ip, port).start()
+            lg.info("%s on %s:%s", what, ip, port)
             return
         except OSError:
             await asyncio.sleep(60)

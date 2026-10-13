@@ -31,3 +31,10 @@ operator_voice = "Shelley (English (UK))"
 # meeting_calendars = ["Work"]   # default: every calendar (`phone meetings` lists them)
 # whisper_provider = "say"       # or "elevenlabs_v3" with whisper_text = "[whispers] Pssst... you have a meeting."
 # whisper_voice = "Whisper"
+# Sessions on another computer (README: "Sessions on another computer"). On the Mac:
+# remote_listen = true            # serve them on remote_bind:remote_port with the token from `phone secret remote`
+# remote_bind = ""                # default lan_ip
+# remote_port = 8767
+# remote_cidr = ""                # default lan_cidr
+# On the other computer, instead of everything above but owner_name:
+# remote_url = "http://192.168.1.50:8767"

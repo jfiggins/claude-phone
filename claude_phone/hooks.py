@@ -9,7 +9,7 @@ import subprocess
 import sys
 from pathlib import Path
 
-from . import log, registry
+from . import config, log, registry
 
 
 def _git(cwd: str, *args: str) -> str | None:
@@ -39,6 +39,24 @@ def iterm_unique_id() -> str | None:
     return v.split(":", 1)[1] if v and ":" in v else v
 
 
+def remote_hook(event: str, sid: str) -> int:
+    """On a client install nothing is registered (the Mac can't type here). Instead, when a turn starts or
+    ends, collect any voicemail answers left for this session and hand them to Claude."""
+    if event not in ("prompt", "stop"):
+        return 0
+    from . import remote
+    answers = remote.request("/answers", {"session_id": sid}).get("answers") or []
+    if not answers:
+        return 0
+    text = "\n".join(answers)
+    log.get("hook").info("collected %s answers for sid=%s", len(answers), sid)
+    if event == "prompt":
+        print(text)  # UserPromptSubmit: plain stdout is added to the turn's context
+    else:
+        print(json.dumps({"decision": "block", "reason": text}))  # Stop: keep going with the answer
+    return 0
+
+
 def run(event: str) -> int:
     lg = log.get("hook")
     try:
@@ -48,6 +66,8 @@ def run(event: str) -> int:
             return 0
         if payload.get("agent_id"):
             return 0  # subagent events share the parent's session; nothing to register
+        if config.load().remote_url:
+            return remote_hook(event, sid)
         if event == "session-start":
             cwd = payload.get("cwd") or os.getcwd()
             iterm = iterm_unique_id()

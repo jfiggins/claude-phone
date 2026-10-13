@@ -34,7 +34,7 @@ CREATE TABLE IF NOT EXISTS voicemails (
   state       TEXT NOT NULL DEFAULT 'pending',  -- pending | answered | deleted
   answer      TEXT,
   answered_at REAL,
-  delivery    TEXT                              -- sent | session-ended | failed:<why>
+  delivery    TEXT                              -- sent | session-ended | failed:<why> | remote-pending
 );
 CREATE TABLE IF NOT EXISTS ringtones (
   repo TEXT PRIMARY KEY,
@@ -87,6 +87,7 @@ class Voicemail:
     answer: str | None
     answered_at: float | None
     delivery: str | None
+    host: str | None = None  # set for a session on another computer: its answer waits to be collected
 
 
 @contextmanager
@@ -96,10 +97,20 @@ def connect():
     db.row_factory = sqlite3.Row
     db.execute("PRAGMA journal_mode=WAL")
     db.executescript(SCHEMA)
+    _migrate(db)
     try:
         yield db
     finally:
         db.close()
+
+
+def _migrate(db) -> None:
+    """Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an existing table alone."""
+    if "host" not in {r[1] for r in db.execute("PRAGMA table_info(voicemails)")}:
+        try:
+            db.execute("ALTER TABLE voicemails ADD COLUMN host TEXT")
+        except sqlite3.OperationalError:
+            pass  # another process added it first
 
 
 def _session(row) -> Session | None:
@@ -190,11 +201,12 @@ def _vm(row) -> Voicemail | None:
 
 
 def add_voicemail(session_id: str, ext: int | None, label: str, question: str,
-                  context: str | None, audio: str | None) -> int:
+                  context: str | None, audio: str | None, host: str | None = None) -> int:
     with connect() as db:
         cur = db.execute(
-            "INSERT INTO voicemails (session_id, ext, label, question, context, audio, created_at) VALUES (?,?,?,?,?,?,?)",
-            (session_id, ext, label, question, context, audio, time.time()),
+            "INSERT INTO voicemails (session_id, ext, label, question, context, audio, created_at, host)"
+            " VALUES (?,?,?,?,?,?,?,?)",
+            (session_id, ext, label, question, context, audio, time.time(), host),
         )
         return cur.lastrowid
 
@@ -208,6 +220,21 @@ def answer_voicemail(vm_id: int, answer: str, delivery: str) -> None:
     with connect() as db:
         db.execute("UPDATE voicemails SET state='answered', answer=?, answered_at=?, delivery=? WHERE id=?",
                    (answer, time.time(), delivery, vm_id))
+
+
+REMOTE_PENDING = "remote-pending"
+
+
+def take_remote_answers(session_id: str) -> list[Voicemail]:
+    """Answers waiting for a session on another computer, marked sent as they are handed over."""
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        rows = [_vm(r) for r in db.execute(
+            "SELECT * FROM voicemails WHERE session_id=? AND state='answered' AND delivery=? ORDER BY answered_at",
+            (session_id, REMOTE_PENDING))]
+        db.executemany("UPDATE voicemails SET delivery='sent' WHERE id=?", [(v.id,) for v in rows])
+        db.execute("COMMIT")
+        return rows
 
 
 def delete_voicemail(vm_id: int) -> None:

@@ -78,6 +78,16 @@ class Settings:
     # Push to the ntfy app when a call is missed. The topic is a secret in the keychain (`phone push`).
     ntfy_server: str = "https://ntfy.sh"
     push_text: bool = True  # include the question/announcement; False sends only who called
+    # Sessions on other computers (e.g. Windows). On the Mac: remote_listen = true serves call_<owner>,
+    # notify_<owner> and transfer_call to them on remote_bind:remote_port (default lan_ip), for addresses in
+    # remote_cidr (default lan_cidr), with the token from `phone secret remote`.
+    remote_listen: bool = False
+    remote_bind: str = ""
+    remote_port: int = 8767
+    remote_cidr: str = ""
+    # On the other computer: the Mac's address, e.g. "http://192.168.1.50:8767". Set, this install is a client:
+    # its MCP server and hooks talk to that daemon instead of running a phone system of their own.
+    remote_url: str = ""
 
     @property
     def owner(self) -> str:
@@ -96,7 +106,7 @@ class Settings:
 
     @property
     def daemon_url(self) -> str:
-        return f"http://127.0.0.1:{self.daemon_port}"
+        return self.remote_url.rstrip("/") or f"http://127.0.0.1:{self.daemon_port}"
 
     @property
     def whisper_url(self) -> str:
@@ -110,7 +120,7 @@ def load() -> Settings:
         for k, v in data.items():
             if hasattr(s, k):
                 setattr(s, k, v)
-    if not s.lan_ip:
+    if not s.lan_ip and not s.remote_url:
         s.lan_ip = detect_lan_ip() or ""
     if s.lan_ip and not s.lan_cidr:
         s.lan_cidr = s.lan_ip.rsplit(".", 1)[0] + ".0/24"

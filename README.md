@@ -126,6 +126,43 @@ announcements go to the screen only, and nothing is pushed to your mobile.
 
 Install the free ntfy app, run `phone push` in a terminal and subscribe to the topic it prints (treat it as a password), then `phone push test`. A `call_<name>` that goes to voicemail, or a `notify_<name>` that isn't heard, then pushes to the app. Pushes pass through the public ntfy.sh server; set `push_text = false` in config.toml to send only who called.
 
+### Sessions on another computer (Windows, Linux)
+
+Claude Code sessions on another computer on the LAN can use the Mac's phone too. They get `call_<name>`,
+`notify_<name>` and `transfer_call`, and voicemail answers reach them. They get no extension: the Mac can't type
+into them, so they can't be dialled, rung by all-hands (9) or transferred *to*.
+
+On the Mac, in `~/.claude-phone/config.toml`, then `phone restart daemon`:
+
+```toml
+remote_listen = true
+# remote_bind = "100.64.0.5"     # default lan_ip; e.g. a Tailscale address instead
+# remote_port = 8767
+# remote_cidr = "192.168.1.0/24" # default lan_cidr: who may connect at all
+```
+
+`phone secret remote` prints the token every request must carry (created on first use).
+
+On the other computer (Python 3.12+; no Asterisk, whisper or iTerm2):
+
+```sh
+python -m venv .venv && .venv/Scripts/pip install -e .        # .venv/bin on Linux
+# ~/.claude-phone/config.toml:
+#   owner_name = "Sam"
+#   remote_url = "http://192.168.1.50:8767"
+.venv/Scripts/phone secret remote --set <token from the Mac>   # kept in ~/.claude-phone/secrets/remote
+.venv/Scripts/phone status                                     # "client of ..." and the Mac's health
+claude mcp add --scope user claude-phone -- "<full path>/.venv/Scripts/phone.exe" mcp
+```
+
+Then add two hooks to `~/.claude/settings.json`: `UserPromptSubmit` running `<full path>/phone.exe hook prompt`
+and `Stop` running `<full path>/phone.exe hook stop`. On a client they register nothing; they ask the Mac for
+voicemail answers left for this session. One collected when a turn ends keeps Claude going with it; one
+collected when you type is added to that turn. An idle session gets its answer the next time you type in it.
+Add [docs/claude-md-snippet.md](docs/claude-md-snippet.md) to `~/.claude/CLAUDE.md` as on the Mac.
+
+The traffic is plain HTTP with a bearer token: fine on a home LAN or a Tailscale network, not across the internet.
+
 ## Running
 
 Everything runs as launchd user agents (`com.claude-phone.{asterisk,whisper,daemon}`, KeepAlive, start at login):

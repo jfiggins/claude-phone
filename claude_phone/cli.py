@@ -226,6 +226,15 @@ def cmd_restart(a) -> None:
 
 
 def cmd_status(a) -> None:
+    s = config.load()
+    if s.remote_url:
+        from . import remote
+        print("client of", s.daemon_url, "(token set)" if keychain.get(remote.TOKEN) else "(NO TOKEN: phone secret remote --set ...)")
+        try:
+            print("health   ", remote.request("/health"))
+        except Exception as e:
+            print("health    unavailable:", e)
+        return
     w = config.ip_warning()
     if w:
         print("WARNING:", w)
@@ -279,7 +288,11 @@ def cmd_mcp(a) -> None:
 
 
 def cmd_secret(a) -> None:
-    print(keychain.get_or_create(a.name))
+    if a.set:
+        keychain.put(a.name, a.set)
+        print(f"{a.name}: saved")
+        return
+    print(keychain.get_or_create(a.name, 24 if a.name == "remote" else 12))
 
 
 def cmd_hold_music(a) -> None:
@@ -349,8 +362,9 @@ def main() -> None:
     sp.set_defaults(fn=cmd_hook)
     sub.add_parser("daemon").set_defaults(fn=cmd_daemon)
     sub.add_parser("mcp").set_defaults(fn=cmd_mcp)
-    sp = sub.add_parser("secret", help="print (creating if needed) a keychain secret: sip | ari")
-    sp.add_argument("name", choices=["sip", "ari"])
+    sp = sub.add_parser("secret", help="print (creating if needed) a keychain secret: sip | ari | remote")
+    sp.add_argument("name", choices=["sip", "ari", "remote"])
+    sp.add_argument("--set", metavar="VALUE", help="store VALUE instead (on a client: the Mac's remote token)")
     sp.set_defaults(fn=cmd_secret)
     sp = sub.add_parser("hold-music", help="generate new hold music with ElevenLabs Music")
     sp.add_argument("prompt", nargs="?")
