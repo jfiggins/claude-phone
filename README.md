@@ -47,7 +47,7 @@ On any recording: `#` ends it, hanging up also ends it. In voicemail: `#` during
 
 ## Setup
 
-0. **Tools:** `xcode-select --install`, then `brew install openssl@3 whisper-cpp`.
+0. **Tools:** `xcode-select --install`, then `brew install openssl@3 whisper-cpp pkgconf` (Asterisk's configure stops with "pkg-config not found" without pkgconf).
 1. **Asterisk** (about 10 minutes): `scripts/build-asterisk.sh` builds 22.11 into `~/.claude-phone/asterisk`.
    The first start after a build takes about 45 s while macOS scans the new libraries.
 2. **Speech model:** the first start (step 6) downloads `ggml-large-v3-turbo-q5_0.bin` (~550 MB) on first run.
