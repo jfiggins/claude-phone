@@ -80,7 +80,10 @@ Confirm. The power LED flashes red when there are questions waiting.
 
 **Claude soft key (live, use this).** The phone fetches the list on every press.
 **Dsskey → Programmable Key**: on the soft key that was Directory, set Type **XML Browser**, Label `Claude`,
-Value `http://<mac-ip>:8766/sessions.xml`. Confirm. Press it, pick a session, press Dial.
+Value `http://<mac-ip>:8766/sessions.xml`. Confirm. Press it, pick a session, press Select (or OK): the Mac
+rings the phone straight back on the Claude account, picked up on the speaker, and puts you through. It
+works the same when the Claude account isn't the phone's first or default one, which is what a selected
+entry would otherwise be dialled on. The Claude account's line key also dials the highlighted entry.
 
 **Directory phonebook (cached).** Remote phonebooks refresh at most hourly, and nested folders are
 prefetched with the top level, so this list goes stale. Kept for completeness (Menu → Directory → Claude):

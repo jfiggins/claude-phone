@@ -24,9 +24,10 @@ def test_spoken_label():
 def test_browser_xml_lists_sessions_and_escapes():
     s = Session(session_id="x", ext=301, repo="a&b", branch="main", worktree=None, cwd=None, iterm_id=None,
                 status="idle", started_at=0, updated_at=0)
-    xml = browser_xml([s], Settings())
-    assert "<Prompt>301 a&amp;b/main</Prompt><URI>301</URI>" in xml
-    assert "<Title>Claude (1 live)</Title>" in xml
+    xml = browser_xml([s], Settings(), "http://10.0.0.5:8766")
+    # Selecting it asks the Mac to ring back on the Claude account; the line key still dials the number.
+    assert ("<Prompt>301 a&amp;b/main</Prompt><URI>http://10.0.0.5:8766/dial/301</URI><Dial>301</Dial>") in xml
+    assert "<Title>Claude (1 live)</Title>" in xml and "<YealinkIPPhoneTextMenu " in xml
 
 
 def test_spinner_detects_running_turn():

@@ -23,9 +23,9 @@ def test_session_start_lists_it_on_the_phone_with_its_computer(ctl, monkeypatch)
     assert status == 200 and res == {"ok": True, "ext": 302}
     [mac, pc] = registry.all_sessions()
     assert (pc.ext, pc.host, pc.pid, pc.iterm_id) == (302, "DESKTOP", 4242, None)
-    xml = daemon.browser_xml(registry.all_sessions(), ctl.s)
+    xml = daemon.browser_xml(registry.all_sessions(), ctl.s, "http://mac:8766")
     assert "<Prompt>301 site-be-v2/main</Prompt>" in xml
-    assert "<Prompt>302 teamfiggins/main (DESKTOP)</Prompt><URI>302</URI>" in xml
+    assert "<Prompt>302 teamfiggins/main (DESKTOP)</Prompt><URI>http://mac:8766/dial/302</URI>" in xml
 
 
 def test_session_end_removes_it_but_never_a_mac_session(ctl, monkeypatch):

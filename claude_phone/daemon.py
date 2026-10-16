@@ -73,16 +73,21 @@ def phonebook_xml(sessions: list[registry.Session], s: config.Settings) -> str:
     return f'<?xml version="1.0" encoding="UTF-8"?><YealinkIPPhoneDirectory>{rows}</YealinkIPPhoneDirectory>'
 
 
-def browser_xml(sessions: list[registry.Session], s: config.Settings) -> str:
-    """Yealink XML Browser directory object (a different schema from the remote phonebook).
-    Each item dials its extension when selected."""
+def browser_xml(sessions: list[registry.Session], s: config.Settings, base: str = "") -> str:
+    """Yealink XML Browser text menu (a different schema from the remote phonebook). Selecting an item opens
+    base/dial/<ext>, and the Mac rings the phone back on the Claude account (see click_to_call): a phone
+    with several accounts dials a selected directory entry on its default one, which may not be ours.
+    The line key still dials <Dial> on that line's account."""
     from xml.sax.saxutils import escape
+    base = base or f"http://{s.lan_ip}:{s.phonebook_port}"
     entries = [(f"{x.ext} {directory_name(x, s)}", str(x.ext)) for x in sessions]
     entries += [(f"{s.voicemail_ext} Voicemail", s.voicemail_ext)]
-    items = "".join(f"<MenuItem><Prompt>{escape(p)}</Prompt><URI>{escape(u)}</URI></MenuItem>" for p, u in entries)
+    items = "".join(f"<MenuItem><Prompt>{escape(p)}</Prompt><URI>{escape(f'{base}/dial/{e}')}</URI>"
+                    f"<Dial>{escape(e)}</Dial></MenuItem>" for p, e in entries)
     title = f"Claude ({len(sessions)} live)"
-    return (f'<?xml version="1.0" encoding="UTF-8"?><YealinkIPPhoneDirectory Beep="no" Timeout="60" LockIn="no">'
-            f"<Title>{escape(title)}</Title>{items}</YealinkIPPhoneDirectory>")
+    return (f'<?xml version="1.0" encoding="UTF-8"?>'
+            f'<YealinkIPPhoneTextMenu Beep="no" Timeout="60" LockIn="no" style="none">'
+            f"<Title>{escape(title)}</Title>{items}</YealinkIPPhoneTextMenu>")
 
 
 def caller_id(label: str, limit: int) -> str:
@@ -1025,8 +1030,58 @@ class Controller:
         if ip_address(request.remote or "0.0.0.0") not in ip_network(self.s.lan_cidr):
             raise web.HTTPForbidden()
         lg.info("phonebook %s fetched by %s", request.path, request.remote)
-        render = browser_xml if request.path == "/sessions.xml" else phonebook_xml
-        return web.Response(text=render(registry.all_sessions(), self.s), content_type="text/xml")
+        if request.path == "/sessions.xml":
+            # Links back to the address the phone used, whatever lan_ip says.
+            xml = browser_xml(registry.all_sessions(), self.s, f"http://{request.host}")
+        else:
+            xml = phonebook_xml(registry.all_sessions(), self.s)
+        return web.Response(text=xml, content_type="text/xml")
+
+    async def http_dial(self, request: web.Request) -> web.Response:
+        """An item picked from the Claude soft key's menu: answer the phone with a note at once, then ring
+        it back on the Claude account."""
+        if ip_address(request.remote or "0.0.0.0") not in ip_network(self.s.lan_cidr):
+            raise web.HTTPForbidden()
+        ext = request.match_info["ext"]
+        lg.info("click to call %s from %s", ext, request.remote)
+        note = "Ringing you on the Claude line." if not self.line.locked() else "The line's busy. Try again shortly."
+        asyncio.create_task(self.click_to_call(ext))
+        return web.Response(text=screen.text_screen("Claude", note, timeout=8), content_type="text/xml")
+
+    async def click_to_call(self, ext: str) -> None:
+        """Ring the desk phone on the Claude account, picked up on the speaker by itself, and put the owner
+        through to the session (or voicemail), just as if they had dialled it on that account."""
+        if ext == self.s.voicemail_ext:
+            label, repo = "Voicemail", None
+        else:
+            sess = registry.by_ext(int(ext))
+            if not sess:
+                lg.info("click to call %s: no session", ext)
+                return
+            label, repo = sess.label, sess.repo
+        if self.line.locked():
+            lg.info("click to call %s: line busy", ext)
+            return
+        async with self.line:
+            call, why = await self.ring({"label": label, "repo": repo, "ext": ext}, "ck", auto_answer=True)
+            if not call:
+                lg.info("click to call %s not answered: %s", ext, why)
+                return
+            try:
+                if ext == self.s.voicemail_ext:
+                    await self.voicemail(call)
+                else:
+                    await self.dial_session(call, int(ext))
+            except Hangup:
+                pass
+            except Exception as e:
+                lg.exception("click to call %s failed: %r", ext, e)
+            finally:
+                try:
+                    await call.hangup()
+                except Exception:
+                    pass
+                call.close()
 
     async def http_whisper(self, request: web.Request) -> web.Response:
         body = await request.json()
@@ -1069,6 +1124,7 @@ async def main() -> None:
     book = web.Application()
     book.router.add_get("/phonebook.xml", c.http_sessions)
     book.router.add_get("/sessions.xml", c.http_sessions)
+    book.router.add_get(r"/dial/{ext:\d+}", c.http_dial)
     book.router.add_get("/dnd/{state:on|off}", c.http_dnd)
     book_runner = web.AppRunner(book)
     await book_runner.setup()
