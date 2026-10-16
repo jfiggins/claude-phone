@@ -50,6 +50,14 @@ CREATE TABLE IF NOT EXISTS injections (
   text       TEXT NOT NULL,
   result     TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS messages (
+  id           INTEGER PRIMARY KEY AUTOINCREMENT,
+  session_id   TEXT NOT NULL,
+  text         TEXT NOT NULL,
+  source       TEXT NOT NULL,
+  created_at   REAL NOT NULL,
+  delivered_at REAL
+);
 """
 
 
@@ -65,6 +73,10 @@ class Session:
     status: str
     started_at: float
     updated_at: float
+    # A session on another computer: no iTerm tab, so its computer's name and its claude process instead.
+    host: str | None = None
+    pid: int | None = None
+    seen_at: float | None = None  # its last hook or heartbeat; it is dropped when these stop
 
     @property
     def label(self) -> str:
@@ -106,11 +118,13 @@ def connect():
 
 def _migrate(db) -> None:
     """Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an existing table alone."""
-    if "host" not in {r[1] for r in db.execute("PRAGMA table_info(voicemails)")}:
-        try:
-            db.execute("ALTER TABLE voicemails ADD COLUMN host TEXT")
-        except sqlite3.OperationalError:
-            pass  # another process added it first
+    for table, column, kind in (("voicemails", "host", "TEXT"), ("sessions", "host", "TEXT"),
+                                ("sessions", "pid", "INTEGER"), ("sessions", "seen_at", "REAL")):
+        if column not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
+            try:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
+            except sqlite3.OperationalError:
+                pass  # another process added it first
 
 
 def _session(row) -> Session | None:
@@ -118,22 +132,27 @@ def _session(row) -> Session | None:
 
 
 def register(session_id: str, repo: str, branch: str | None, worktree: str | None,
-             cwd: str | None, iterm_id: str | None) -> Session:
+             cwd: str | None, iterm_id: str | None, host: str | None = None, pid: int | None = None) -> Session:
     """Add a session and give it an extension. A new session in a tab that already has one
-    (after /clear, resume, compact) inherits that tab's extension."""
+    (after /clear, resume, compact) inherits that tab's extension. On another computer the claude
+    process (host, pid) plays the tab's part: it outlives /clear, which only changes the session id."""
     s = config.load()
     now = time.time()
     with connect() as db:
         db.execute("BEGIN IMMEDIATE")
         existing = db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone()
         ext = existing["ext"] if existing else None
-        if ext is None and iterm_id:
-            prev = db.execute("SELECT * FROM sessions WHERE iterm_id=?", (iterm_id,)).fetchone()
+        if ext is None and (iterm_id or (host and pid)):
+            prev = (db.execute("SELECT * FROM sessions WHERE iterm_id=?", (iterm_id,)) if iterm_id else
+                    db.execute("SELECT * FROM sessions WHERE host=? AND pid=?", (host, pid))).fetchone()
             if prev:
                 ext = prev["ext"]
                 db.execute("DELETE FROM sessions WHERE session_id=?", (prev["session_id"],))
-                # Pending questions from the replaced session now belong to the tab's new session.
-                db.execute("UPDATE voicemails SET session_id=? WHERE session_id=? AND state='pending'",
+                # Pending questions from the replaced session now belong to the tab's new session, and so
+                # do answers and messages still waiting to be collected by a session on another computer.
+                db.execute("UPDATE voicemails SET session_id=? WHERE session_id=?"
+                           " AND (state='pending' OR delivery=?)", (session_id, prev["session_id"], REMOTE_PENDING))
+                db.execute("UPDATE messages SET session_id=? WHERE session_id=? AND delivered_at IS NULL",
                            (session_id, prev["session_id"]))
         if ext is None:
             used = {r[0] for r in db.execute("SELECT ext FROM sessions")}
@@ -142,11 +161,13 @@ def register(session_id: str, repo: str, branch: str | None, worktree: str | Non
                 db.execute("ROLLBACK")
                 raise RuntimeError("no free extensions")
         db.execute(
-            """INSERT INTO sessions (session_id, ext, repo, branch, worktree, cwd, iterm_id, status, started_at, updated_at)
-               VALUES (?,?,?,?,?,?,?, 'idle', ?, ?)
+            """INSERT INTO sessions (session_id, ext, repo, branch, worktree, cwd, iterm_id, status, started_at, updated_at,
+                                     host, pid, seen_at)
+               VALUES (?,?,?,?,?,?,?, 'idle', ?, ?, ?, ?, ?)
                ON CONFLICT(session_id) DO UPDATE SET repo=excluded.repo, branch=excluded.branch,
-                 worktree=excluded.worktree, cwd=excluded.cwd, iterm_id=excluded.iterm_id, updated_at=excluded.updated_at""",
-            (session_id, ext, repo, branch, worktree, cwd, iterm_id, now, now),
+                 worktree=excluded.worktree, cwd=excluded.cwd, iterm_id=excluded.iterm_id, updated_at=excluded.updated_at,
+                 host=excluded.host, pid=excluded.pid, seen_at=excluded.seen_at""",
+            (session_id, ext, repo, branch, worktree, cwd, iterm_id, now, now, host, pid, now if host else None),
         )
         db.execute("COMMIT")
         return _session(db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone())
@@ -192,6 +213,48 @@ def remove_missing(live_iterm_ids: set[str]) -> list[Session]:
         for s in gone:
             db.execute("DELETE FROM sessions WHERE session_id=?", (s.session_id,))
     return gone
+
+
+# --- sessions on another computer ---
+
+def seen(host: str, pid: int | None, session_id: str | None, status: str | None = None) -> int:
+    """A hook or heartbeat from another computer: the session is still open. Matched by its claude process
+    as well as its id, since the MCP server's heartbeat keeps the first session id after /clear.
+    Returns how many sessions it matched."""
+    now = time.time()
+    with connect() as db:
+        cur = db.execute(
+            "UPDATE sessions SET seen_at=?, status=COALESCE(?, status), updated_at=?"
+            " WHERE host=? AND (session_id=? OR (? IS NOT NULL AND pid=?))",
+            (now, status, now, host, session_id, pid, pid))
+        return cur.rowcount
+
+
+def expire_remote(cutoff: float) -> list[Session]:
+    """Drop sessions on other computers not heard from since cutoff (closed without a SessionEnd)."""
+    with connect() as db:
+        gone = [_session(r) for r in db.execute(
+            "SELECT * FROM sessions WHERE host IS NOT NULL AND COALESCE(seen_at, updated_at) < ?", (cutoff,))]
+        db.executemany("DELETE FROM sessions WHERE session_id=?", [(s.session_id,) for s in gone])
+    return gone
+
+
+def queue_message(session_id: str, text: str, source: str) -> None:
+    """What a session on another computer is sent instead of having it typed: its hooks collect it."""
+    with connect() as db:
+        db.execute("INSERT INTO messages (session_id, text, source, created_at) VALUES (?,?,?,?)",
+                   (session_id, text, source, time.time()))
+
+
+def take_messages(session_id: str) -> list[str]:
+    """Messages waiting for a session on another computer, marked delivered as they are handed over."""
+    with connect() as db:
+        db.execute("BEGIN IMMEDIATE")
+        rows = db.execute("SELECT id, text FROM messages WHERE session_id=? AND delivered_at IS NULL ORDER BY id",
+                          (session_id,)).fetchall()
+        db.executemany("UPDATE messages SET delivered_at=? WHERE id=?", [(time.time(), r["id"]) for r in rows])
+        db.execute("COMMIT")
+        return [r["text"] for r in rows]
 
 
 # --- voicemail ---

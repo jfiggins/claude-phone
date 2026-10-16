@@ -28,6 +28,9 @@ REMOTE_VOICEMAIL_MESSAGE = ("{owner} didn't answer. A voicemail has been left. C
                             "assumption; the answer will arrive in this session when a turn ends or {owner} next types.")
 ANSWER_PREFIX = "[Phone answer to your earlier question]"
 ALLHANDS_PREFIX = "[All-hands message from {owner}, sent to every session]"
+# A dial-in reaches a session on another computer through its hooks, not as typed text, so say who it's from.
+MESSAGE_PREFIX = "[Phone message from {owner}]"
+REMOTE_TTL = 300  # seconds without a hook or heartbeat before a session on another computer is dropped
 # Claude Code's spinner line while a turn runs, e.g. "· Generating… (1m 51s · ↓ 4.3k tokens)".
 SPINNER = re.compile(r"…\s*\(\d+[hms]|esc to interrupt")
 HOLD_MAX = 600  # seconds on hold before the message is taken anyway
@@ -50,10 +53,16 @@ def ringtone(repo: str, overrides: dict) -> int:
     return registry.ringtone(repo)
 
 
+def directory_name(x: registry.Session, s: config.Settings) -> str:
+    """repo/branch as on caller ID, plus the computer's name for a session that isn't on the Mac."""
+    name = caller_id(x.label, s.callerid_max)
+    return f"{name} ({x.host[:10]})" if x.host else name
+
+
 def phonebook_xml(sessions: list[registry.Session], s: config.Settings) -> str:
     """Yealink remote phonebook: live sessions, then the fixed lines."""
     from xml.sax.saxutils import escape
-    entries = [(caller_id(x.label, s.callerid_max), str(x.ext)) for x in sessions]
+    entries = [(directory_name(x, s), str(x.ext)) for x in sessions]
     entries += [("Voicemail", s.voicemail_ext), ("Echo test", "600")]
     rows = "".join(f"<DirectoryEntry><Name>{escape(n)}</Name><Telephone>{escape(t)}</Telephone></DirectoryEntry>"
                    for n, t in entries)
@@ -64,7 +73,7 @@ def browser_xml(sessions: list[registry.Session], s: config.Settings) -> str:
     """Yealink XML Browser directory object (a different schema from the remote phonebook).
     Each item dials its extension when selected."""
     from xml.sax.saxutils import escape
-    entries = [(f"{x.ext} {caller_id(x.label, s.callerid_max)}", str(x.ext)) for x in sessions]
+    entries = [(f"{x.ext} {directory_name(x, s)}", str(x.ext)) for x in sessions]
     entries += [(f"{s.voicemail_ext} Voicemail", s.voicemail_ext)]
     items = "".join(f"<MenuItem><Prompt>{escape(p)}</Prompt><URI>{escape(u)}</URI></MenuItem>" for p, u in entries)
     title = f"Claude ({len(sessions)} live)"
@@ -193,6 +202,11 @@ class Controller:
                     lg.info("removed stale session ext=%s %s", s.ext, s.label)
             except Exception as e:
                 lg.warning("stale sweep failed: %r", e)
+            try:
+                for s in registry.expire_remote(time.time() - REMOTE_TTL):
+                    lg.info("removed silent session ext=%s %s on %s", s.ext, s.label, s.host)
+            except Exception as e:
+                lg.warning("remote sweep failed: %r", e)
             if sweeps % 60 == 0:
                 try:
                     done = await asyncio.to_thread(housekeeping.run)
@@ -337,10 +351,23 @@ class Controller:
                 await call.play(tts.phrase("nothing_heard"))
             return
         sess = registry.by_ext(ext) or sess  # may have been re-registered during the call
-        result = await asyncio.to_thread(inject.type_into, sess, f"{prefix} {text}" if prefix else text, source)
+        if sess.host and not prefix:
+            prefix = MESSAGE_PREFIX.format(owner=self.s.owner)
+        result = await self.deliver(sess, f"{prefix} {text}" if prefix else text, source)
         if call.up:
-            await call.play(tts.phrase("sent" if result == "sent" else "inject_failed"))
-        return text if result == "sent" else None
+            await call.play(tts.phrase({"sent": "sent", "queued": "queued"}.get(result, "inject_failed")))
+        return text if result in ("sent", "queued") else None
+
+    async def deliver(self, sess: registry.Session, text: str, source: str) -> str:
+        """Type into a session on the Mac ('sent'), or leave the text for a session on another computer
+        to collect with its hooks ('queued'). Anything else is why it failed."""
+        if not sess.host:
+            return await asyncio.to_thread(inject.type_into, sess, text, source)
+        text = " ".join(text.split())
+        registry.queue_message(sess.session_id, text, source)
+        registry.log_injection(sess, source, text, "queued")
+        lg.info("queued for ext=%s %s on %s source=%s text=%r", sess.ext, sess.label, sess.host, source, text)
+        return "queued"
 
     async def mid_task(self, ext: int) -> bool:
         """The hooks say it's working and Claude Code's spinner is on screen. The hooks alone can stick on
@@ -472,8 +499,8 @@ class Controller:
             return
         sent = 0
         for sess in registry.all_sessions():  # re-read: sessions may have come or gone during the call
-            result = await asyncio.to_thread(inject.type_into, sess, f"{ALLHANDS_PREFIX.format(owner=self.s.owner)} {text}", "all-hands")
-            sent += result == "sent"
+            result = await self.deliver(sess, f"{ALLHANDS_PREFIX.format(owner=self.s.owner)} {text}", "all-hands")
+            sent += result in ("sent", "queued")
         lg.info("all-hands sent to %s sessions", sent)
         if call.up:
             await call.play(await tts.render_async(
@@ -528,16 +555,22 @@ class Controller:
 
     @staticmethod
     def remote_caller(body: dict, agent: str | None) -> dict:
-        """A session on another computer. It has no extension and nothing can be typed into it, so it is
-        never registered: it can't be dialled, rung by all-hands or transferred to."""
+        """A session on another computer. Its hooks register it (see http_session), and then its extension
+        shows as the caller ID; a call doesn't register it, as only the hooks know when it ends."""
         repo = (body.get("repo") or "remote").strip()
         branch = body.get("worktree") or body.get("branch")
         label = f"{repo}/{branch}" if branch else repo
         intro = tts.spoken_label(f"{repo}/{branch}" if branch and branch not in ("main", "master") else repo)
+        host = body.get("host") or "remote"
+        sess = registry.find(body.get("session_id"))
+        if not (sess and sess.host == host) and body.get("pid"):
+            # The MCP server's session id is the first one after /clear; its claude process still matches.
+            sess = next((x for x in registry.all_sessions() if x.host == host and x.pid == body["pid"]), None)
+        ext = sess.ext if sess and sess.host == host else None
         if agent:
             label, intro = f"{label}@{agent}", f"{intro}, {agent}"
-        return {"label": label, "ext": None, "sid": body.get("session_id") or "", "repo": repo, "intro": intro,
-                "host": body.get("host") or "remote"}
+        return {"label": label, "ext": ext, "sid": body.get("session_id") or "", "repo": repo, "intro": intro,
+                "host": host}
 
     async def ring(self, c: dict, prefix: str, auto_answer: bool = False) -> tuple[Call | None, str]:
         """Ring the desk phone. Returns (answered call, '') or (None, why not). Caller holds self.line.
@@ -836,23 +869,70 @@ class Controller:
         return await handler(request)
 
     def remote_app(self) -> web.Application:
-        """What sessions on other computers may use: ring the owner, transfer, and collect answers."""
+        """What sessions on other computers may use: ring the owner, transfer, collect answers, and keep
+        themselves on the phone's session list."""
         app = web.Application(middlewares=[self.remote_guard])
         app[REMOTE_APP] = True
         app.router.add_post("/call", self.http_call)
         app.router.add_post("/notify", self.http_notify)
         app.router.add_post("/transfer", self.http_transfer)
         app.router.add_post("/answers", self.http_answers)
+        app.router.add_post("/session", self.http_session)
+        app.router.add_post("/heartbeat", self.http_heartbeat)
         app.router.add_get("/health", self.http_health)
         return app
 
+    @staticmethod
+    def register_remote(body: dict) -> registry.Session | None:
+        """Register (or refresh) a session on another computer from its hook's fields. Its claude process
+        keeps the extension across /clear, as an iTerm tab does on the Mac."""
+        host, repo = body.get("host"), (body.get("repo") or "").strip()
+        if not host or not repo or not body.get("session_id"):
+            return None  # a client from before sessions were listed: it still collects answers
+        pid = body.get("pid") if isinstance(body.get("pid"), int) else None
+        try:
+            sess = registry.register(body["session_id"], repo, body.get("branch"), body.get("worktree"), None, None,
+                                     host=host, pid=pid)
+        except RuntimeError as e:
+            lg.warning("could not register remote session on %s: %r", host, e)
+            return None
+        registry.ringtone(repo)
+        return sess
+
+    async def http_session(self, request: web.Request) -> web.Response:
+        """A remote session's SessionStart and SessionEnd hooks."""
+        body = await self.body(request)
+        sid = body.get("session_id")
+        if body.get("ended"):
+            sess = registry.find(sid) if sid else None
+            if sess and sess.host:  # never a session on the Mac
+                registry.unregister(sid)
+                lg.info("remote session end ext=%s %s on %s", sess.ext, sess.label, sess.host)
+            return web.json_response({"ok": True})
+        sess = self.register_remote(body)
+        if sess:
+            lg.info("remote session start ext=%s %s on %s sid=%s", sess.ext, sess.label, sess.host, sid)
+        return web.json_response({"ok": bool(sess), "ext": sess.ext if sess else None})
+
+    async def http_heartbeat(self, request: web.Request) -> web.Response:
+        """A remote session's MCP server, every minute: the session is still open."""
+        body = await self.body(request)
+        pid = body.get("pid") if isinstance(body.get("pid"), int) else None
+        n = registry.seen(body["host"], pid, body.get("session_id")) if body.get("host") else 0
+        return web.json_response({"ok": True, "known": bool(n)})
+
     async def http_answers(self, request: web.Request) -> web.Response:
-        """A remote session's hooks collect voicemail answers left for it."""
-        sid = (await self.body(request)).get("session_id")
+        """A remote session's hooks, as each turn starts and ends: the session is still open (registered if
+        the Mac didn't know it), and it collects the voicemail answers and messages waiting for it."""
+        body = await self.body(request)
+        sid = body.get("session_id")
+        if sid and self.register_remote(body) and body.get("status") in ("working", "idle"):
+            registry.set_status(sid, body["status"])
         items = registry.take_remote_answers(sid) if sid else []
-        if items:
-            lg.info("remote %s collected answers %s", request.remote, [v.id for v in items])
-        return web.json_response({"answers": [self.answer_text(v) for v in items]})
+        messages = registry.take_messages(sid) if sid else []
+        if items or messages:
+            lg.info("remote %s collected answers %s and %s messages", request.remote, [v.id for v in items], len(messages))
+        return web.json_response({"answers": [self.answer_text(v) for v in items] + messages})
 
     async def http_transfer(self, request: web.Request) -> web.Response:
         body = await self.body(request)

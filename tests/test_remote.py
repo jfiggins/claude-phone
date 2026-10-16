@@ -116,7 +116,13 @@ def client_install(monkeypatch):
         calls.append((path, body))
         return {"answers": ["[Phone answer to your earlier question] Yes."]}
     monkeypatch.setattr(remote, "request", request)
+    monkeypatch.setattr(hooks, "repo_info", lambda cwd: ("teamfiggins", "main", None))
+    monkeypatch.setattr(remote.socket, "gethostname", lambda: "DESKTOP")
+    monkeypatch.setenv("CLAUDE_PID", "4242")
     return calls
+
+
+FIELDS = {"repo": "teamfiggins", "branch": "main", "worktree": None, "host": "DESKTOP", "pid": 4242}
 
 
 def _hook(monkeypatch, capsys, event, payload):
@@ -128,8 +134,8 @@ def _hook(monkeypatch, capsys, event, payload):
 def test_client_prompt_hook_adds_answers_to_context(client_install, monkeypatch, capsys):
     out = _hook(monkeypatch, capsys, "prompt", {"session_id": "w1"})
     assert out.strip() == "[Phone answer to your earlier question] Yes."
-    assert client_install == [("/answers", {"session_id": "w1"})]
-    assert registry.all_sessions() == []  # nothing registered locally
+    assert client_install == [("/answers", {"session_id": "w1", "status": "working", **FIELDS})]
+    assert registry.all_sessions() == []  # nothing registered locally: the Mac keeps the list
 
 
 def test_client_stop_hook_keeps_claude_going_with_the_answer(client_install, monkeypatch, capsys):
@@ -137,9 +143,12 @@ def test_client_stop_hook_keeps_claude_going_with_the_answer(client_install, mon
     assert json.loads(out) == {"decision": "block", "reason": "[Phone answer to your earlier question] Yes."}
 
 
-def test_client_session_start_does_nothing(client_install, monkeypatch, capsys):
+def test_client_session_start_and_end_tell_the_mac(client_install, monkeypatch, capsys):
     assert _hook(monkeypatch, capsys, "session-start", {"session_id": "w1"}) == ""
-    assert client_install == []
+    _hook(monkeypatch, capsys, "session-end", {"session_id": "w1", "reason": "clear"})  # the next start takes over
+    _hook(monkeypatch, capsys, "session-end", {"session_id": "w1", "reason": "logout"})
+    assert client_install == [("/session", {"session_id": "w1", **FIELDS}),
+                              ("/session", {"session_id": "w1", "ended": True})]
 
 
 def test_client_hook_survives_the_mac_being_away(client_install, monkeypatch, capsys):

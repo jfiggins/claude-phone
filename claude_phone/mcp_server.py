@@ -128,4 +128,6 @@ for fn, name in ((call_owner, f"call_{S.owner_slug}"), (notify_owner, f"notify_{
 
 
 def run() -> None:
+    if S.remote_url:
+        remote.start_heartbeat()
     mcp.run()

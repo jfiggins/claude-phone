@@ -39,17 +39,30 @@ def iterm_unique_id() -> str | None:
     return v.split(":", 1)[1] if v and ":" in v else v
 
 
-def remote_hook(event: str, sid: str) -> int:
-    """On a client install nothing is registered (the Mac can't type here). Instead, when a turn starts or
-    ends, collect any voicemail answers left for this session and hand them to Claude."""
-    if event not in ("prompt", "stop"):
-        return 0
+def remote_hook(event: str, sid: str, payload: dict) -> int:
+    """On a client install the session is registered on the Mac, which lists it on the phone and gives it an
+    extension. Nothing can be typed here from the Mac, so when a turn starts or ends the hooks collect what
+    is waiting for this session (voicemail answers, messages dialled in) and hand it to Claude."""
     from . import remote
-    answers = remote.request("/answers", {"session_id": sid}).get("answers") or []
+    lg = log.get("hook")
+    cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    if event == "session-start":
+        res = remote.request("/session", {"session_id": sid, **remote.caller_fields(cwd)})
+        lg.info("session start ext=%s sid=%s source=%s", res.get("ext"), sid, payload.get("source"))
+        return 0
+    if event == "session-end":
+        if payload.get("reason") != "clear":  # after /clear the next SessionStart takes over the extension
+            remote.request("/session", {"session_id": sid, "ended": True})
+        return 0
+    status = "working" if event == "prompt" else "idle"
+    # The repo fields let the Mac register a session it doesn't know (started before the hooks, or while
+    # the Mac was away), so every turn keeps the phone's list right.
+    res = remote.request("/answers", {"session_id": sid, "status": status, **remote.caller_fields(cwd)})
+    answers = res.get("answers") or []
     if not answers:
         return 0
     text = "\n".join(answers)
-    log.get("hook").info("collected %s answers for sid=%s", len(answers), sid)
+    lg.info("collected %s answers for sid=%s", len(answers), sid)
     if event == "prompt":
         print(text)  # UserPromptSubmit: plain stdout is added to the turn's context
     else:
@@ -67,7 +80,7 @@ def run(event: str) -> int:
         if payload.get("agent_id"):
             return 0  # subagent events share the parent's session; nothing to register
         if config.load().remote_url:
-            return remote_hook(event, sid)
+            return remote_hook(event, sid, payload)
         if event == "session-start":
             cwd = payload.get("cwd") or os.getcwd()
             iterm = iterm_unique_id()

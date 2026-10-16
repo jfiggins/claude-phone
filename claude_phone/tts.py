@@ -157,6 +157,7 @@ PHRASES = {
     "vm_session_gone": "That session has closed, so I've kept your answer in the log.",
     "connected": "You're through to {label}.",
     "sent": "Sent.",
+    "queued": "Sent. That session is on another computer, so it gets this when its turn ends or you next type there.",
     "nothing_heard": "I didn't catch anything, so nothing was sent.",
     "transcribe_failed": "Sorry, I couldn't transcribe that. Nothing was sent.",
     "inject_failed": "I couldn't reach that tab. Nothing was sent.",

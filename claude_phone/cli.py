@@ -256,14 +256,14 @@ def cmd_list(a) -> None:
     if not rows:
         print("No live sessions.")
         return
-    print(f"{'EXT':4} {'REPO':22} {'BRANCH':28} {'STATUS':8} {'RING':5} SINCE")
+    print(f"{'EXT':4} {'REPO':22} {'BRANCH':28} {'STATUS':8} {'RING':5} {'SINCE':5} ON")
     for s in rows:
         b = s.branch or ""
         if s.worktree:
             b = f"{b} [{s.worktree}]"
         since = datetime.fromtimestamp(s.started_at).strftime("%H:%M")
         ring = config.load().repo_ringtones.get(s.repo) or registry.ringtone(s.repo)
-        print(f"{s.ext:<4} {s.repo[:22]:22} {b[:28]:28} {s.status:8} {ring:<5} {since}")
+        print(f"{s.ext:<4} {s.repo[:22]:22} {b[:28]:28} {s.status:8} {ring:<5} {since:5} {s.host or 'this Mac'}")
 
 
 def cmd_vm(a) -> None:

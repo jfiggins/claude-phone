@@ -129,8 +129,11 @@ Install the free ntfy app, run `phone push` in a terminal and subscribe to the t
 ### Sessions on another computer (Windows, Linux)
 
 Claude Code sessions on another computer on the LAN can use the Mac's phone too. They get `call_<name>`,
-`notify_<name>` and `transfer_call`, and voicemail answers reach them. They get no extension: the Mac can't type
-into them, so they can't be dialled, rung by all-hands (9) or transferred *to*.
+`notify_<name>` and `transfer_call`, voicemail answers reach them, and each gets an extension: they're on
+the phone's session list (marked with the computer's name) and in `phone list`, and can be dialled, rung by
+all-hands (9) and transferred to. The Mac can't type into them, so what you say waits for the session's
+hooks: a busy session gets it when its turn ends and carries on with it; an idle one, the next time you
+type in it. The phone says so after the beep instead of "Sent."
 
 On the Mac, in `~/.claude-phone/config.toml`, then `phone restart daemon`:
 
@@ -155,10 +158,13 @@ python -m venv .venv && .venv/Scripts/pip install -e .        # .venv/bin on Lin
 claude mcp add --scope user claude-phone -- "<full path>/.venv/Scripts/phone.exe" mcp
 ```
 
-Then add two hooks to `~/.claude/settings.json`: `UserPromptSubmit` running `<full path>/phone.exe hook prompt`
-and `Stop` running `<full path>/phone.exe hook stop`. On a client they register nothing; they ask the Mac for
-voicemail answers left for this session. One collected when a turn ends keeps Claude going with it; one
-collected when you type is added to that turn. An idle session gets its answer the next time you type in it.
+Then add four hooks to `~/.claude/settings.json`, each running `<full path>/phone.exe hook <event>`:
+`SessionStart` (`session-start`), `SessionEnd` (`session-end`), `UserPromptSubmit` (`prompt`) and `Stop`
+(`stop`). The first two put the session on the Mac's list and take it off. The other two keep it there
+(registering it if the Mac missed its start) and collect what is waiting for it: voicemail answers and
+messages you dialled in. One collected when a turn ends keeps Claude going with it; one collected when you
+type is added to that turn. The MCP server tells the Mac every minute that its session is still open, and
+the Mac drops a session it hasn't heard from for five minutes (a terminal closed without `SessionEnd`).
 Add [docs/claude-md-snippet.md](docs/claude-md-snippet.md) to `~/.claude/CLAUDE.md` as on the Mac.
 
 The traffic is plain HTTP with a bearer token: fine on a home LAN or a Tailscale network, not across the internet.
