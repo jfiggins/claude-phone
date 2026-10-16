@@ -132,8 +132,12 @@ Claude Code sessions on another computer on the LAN can use the Mac's phone too.
 `notify_<name>` and `transfer_call`, voicemail answers reach them, and each gets an extension: they're on
 the phone's session list (marked with the computer's name) and in `phone list`, and can be dialled, rung by
 all-hands (9) and transferred to. The Mac can't type into them, so what you say waits for the session's
-hooks: a busy session gets it when its turn ends and carries on with it; an idle one, the next time you
-type in it. The phone says so after the beep instead of "Sent."
+hooks: a busy session gets it when its turn ends and carries on with it. On Windows an idle one has it typed
+in within a few seconds by its own MCP server (which asks the Mac every 3 s, and types only into a session
+idle for 5 s); on Linux, the next time you type in it. Only your own words are typed: dial-ins, all-hands
+and voicemail answers. A transfer carries a handover note written by another session, so it always waits
+for the hooks, and no session can set an idle one working while you're away. If you're halfway through
+typing in an idle session when a message arrives, it is added to what you've typed.
 
 On the Mac, in `~/.claude-phone/config.toml`, then `phone restart daemon`:
 

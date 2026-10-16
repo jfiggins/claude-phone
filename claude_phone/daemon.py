@@ -34,6 +34,7 @@ MESSAGE_PREFIX = "[Phone message from {owner}]"
 # sent any (its MCP server predates them), after this long with no hook at all.
 REMOTE_TTL = 300
 REMOTE_IDLE_TTL = 12 * 3600
+IDLE_SETTLE = 5  # seconds a session on another computer must have been idle before anything is typed into it
 # Claude Code's spinner line while a turn runs, e.g. "· Generating… (1m 51s · ↓ 4.3k tokens)".
 SPINNER = re.compile(r"…\s*\(\d+[hms]|esc to interrupt")
 HOLD_MAX = 600  # seconds on hold before the message is taken anyway
@@ -883,6 +884,8 @@ class Controller:
         app.router.add_post("/answers", self.http_answers)
         app.router.add_post("/session", self.http_session)
         app.router.add_post("/heartbeat", self.http_heartbeat)
+        app.router.add_post("/pending", self.http_pending)
+        app.router.add_post("/requeue", self.http_requeue)
         app.router.add_get("/health", self.http_health)
         return app
 
@@ -924,6 +927,41 @@ class Controller:
         pid = body.get("pid") if isinstance(body.get("pid"), int) else None
         n = registry.seen(body["host"], pid, body.get("session_id"), beat=True) if body.get("host") else 0
         return web.json_response({"ok": True, "known": bool(n)})
+
+    async def http_pending(self, request: web.Request) -> web.Response:
+        """A remote session's MCP server, every few seconds: the session is still open (a heartbeat), and, once
+        it has been idle a moment, what it should have typed into it. The Mac can't type on another computer,
+        so the MCP server types it there itself. Only the owner's own words (see registry.TYPABLE_SOURCES);
+        a busy session keeps getting everything through its Stop hook."""
+        body = await self.body(request)
+        host = body.get("host")
+        pid = body.get("pid") if isinstance(body.get("pid"), int) else None
+        if not host:
+            return web.json_response({"texts": []})
+        registry.seen(host, pid, body.get("session_id"), beat=True)
+        sess = registry.by_process(host, pid, body.get("session_id"))
+        texts = []
+        if (sess and body.get("can_type") and sess.status == "idle"
+                and time.time() - sess.updated_at >= IDLE_SETTLE):
+            texts = ([self.answer_text(v) for v in registry.take_remote_answers(sess.session_id)]
+                     + registry.take_messages(sess.session_id, typable_only=True))
+            if texts:
+                lg.info("remote ext=%s %s on %s: %s to type into the idle session", sess.ext, sess.label, host, len(texts))
+        return web.json_response({"session_id": sess.session_id if sess else None, "ext": sess.ext if sess else None,
+                                  "texts": texts})
+
+    async def http_requeue(self, request: web.Request) -> web.Response:
+        """The MCP server couldn't type what /pending gave it: keep it for the session's hooks instead (and
+        never offer it for typing again, so a console that refuses keys can't loop)."""
+        body = await self.body(request)
+        sess = registry.find(body.get("session_id"))
+        texts = [t for t in body.get("texts") or [] if isinstance(t, str)]
+        if sess and sess.host and texts:
+            for t in texts:
+                registry.queue_message(sess.session_id, t, "requeued")
+            lg.warning("remote ext=%s on %s couldn't type %s messages (%s); kept for its hooks",
+                       sess.ext, sess.host, len(texts), body.get("error"))
+        return web.json_response({"ok": True})
 
     async def http_answers(self, request: web.Request) -> web.Response:
         """A remote session's hooks, as each turn starts and ends: the session is still open (registered if

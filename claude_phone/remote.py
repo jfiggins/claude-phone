@@ -13,7 +13,7 @@ import urllib.request
 from . import config, keychain
 
 TOKEN = "remote"
-HEARTBEAT_SECONDS = 60
+POLL_SECONDS = 3  # how soon a message dialled in to an idle session is typed into it
 
 
 def headers() -> dict:
@@ -35,20 +35,42 @@ def caller_fields(cwd: str) -> dict:
     return {"repo": repo, "branch": branch, "worktree": worktree, "host": socket.gethostname(), "pid": claude_pid()}
 
 
+def poll_once(body: dict) -> int:
+    """One heartbeat: the session is still open, and, if it has been idle a moment, the Mac hands over the
+    owner's words waiting for it, which are typed into its console. What can't be typed goes back to the
+    Mac for the hooks. Returns how many were typed."""
+    from . import console, log
+    res = request("/pending", body)
+    texts = res.get("texts") or []
+    if not texts:
+        return 0
+    try:
+        console.type_line(body["pid"], " ".join(texts))
+    except Exception as e:
+        request("/requeue", {"session_id": res.get("session_id"), "texts": texts, "error": repr(e)})
+        log.get("mcp").warning("couldn't type %s messages into ext=%s: %r", len(texts), res.get("ext"), e)
+        return 0
+    log.get("mcp").info("typed %s messages into idle ext=%s", len(texts), res.get("ext"))
+    return len(texts)
+
+
 def start_heartbeat() -> None:
-    """From the MCP server, which lives exactly as long as its session: tell the Mac every minute that the
-    session is still open. The Mac lists it on the phone, and drops it a few minutes after the beats stop
-    (a terminal closed without a SessionEnd hook)."""
+    """From the MCP server, which lives exactly as long as its session: tell the Mac every few seconds that
+    the session is still open (the Mac drops it a few minutes after these stop: a terminal closed without a
+    SessionEnd hook), and type in what was dialled in while it sat idle. Typing needs Windows and the claude
+    process's id; without them the session still gets its messages from its hooks."""
+    from . import console
+    pid = claude_pid()
     body = {"session_id": os.environ.get("CLAUDE_CODE_SESSION_ID"), "host": socket.gethostname(),
-            "pid": claude_pid() or os.getppid()}
+            "pid": pid or os.getppid(), "can_type": bool(pid) and console.available()}
 
     def beat() -> None:
         while True:
             try:
-                request("/heartbeat", body)
+                poll_once(body)
             except Exception:
                 pass  # the Mac is away: the session reappears with the next beat or hook
-            time.sleep(HEARTBEAT_SECONDS)
+            time.sleep(POLL_SECONDS)
     threading.Thread(target=beat, name="heartbeat", daemon=True).start()
 
 

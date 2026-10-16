@@ -250,15 +250,29 @@ def remove_missing(live_iterm_ids: set[str]) -> list[Session]:
 def seen(host: str, pid: int | None, session_id: str | None, status: str | None = None, beat: bool = False) -> int:
     """A hook or heartbeat from another computer: the session is still open. Matched by its claude process
     as well as its id, since the MCP server's heartbeat keeps the first session id after /clear.
+    Leaves updated_at alone: it marks the last hook, i.e. how long the session has been idle or working.
     Returns how many sessions it matched."""
     now = time.time()
     with connect() as db:
         cur = db.execute(
-            "UPDATE sessions SET seen_at=?, status=COALESCE(?, status), updated_at=?,"
+            "UPDATE sessions SET seen_at=?, status=COALESCE(?, status),"
             " beat_at=CASE WHEN ? THEN ? ELSE beat_at END"
             " WHERE host=? AND (session_id=? OR (? IS NOT NULL AND pid=?))",
-            (now, status, now, beat, now, host, session_id, pid, pid))
+            (now, status, beat, now, host, session_id, pid, pid))
         return cur.rowcount
+
+
+def by_process(host: str, pid: int | None, session_id: str | None = None) -> Session | None:
+    """The session on another computer run by this claude process (its current id, whatever /clear did)."""
+    with connect() as db:
+        if pid is not None:
+            r = db.execute("SELECT * FROM sessions WHERE host=? AND pid=?", (host, pid)).fetchone()
+            if r:
+                return _session(r)
+        if session_id:
+            return _session(db.execute("SELECT * FROM sessions WHERE host=? AND session_id=?",
+                                       (host, session_id)).fetchone())
+    return None
 
 
 def expire_remote(cutoff: float, idle_cutoff: float) -> list[Session]:
@@ -281,12 +295,19 @@ def queue_message(session_id: str, text: str, source: str) -> None:
                    (session_id, text, source, time.time()))
 
 
-def take_messages(session_id: str) -> list[str]:
+# Messages that may be typed into an idle session on another computer: only the owner's own words. A
+# transfer carries a handover note another Claude session wrote, so it waits for the session's next hook
+# instead: no session can set another one working while nobody is there.
+TYPABLE_SOURCES = ("dial-in %", "all-hands")
+
+
+def take_messages(session_id: str, typable_only: bool = False) -> list[str]:
     """Messages waiting for a session on another computer, marked delivered as they are handed over."""
+    where = " AND (" + " OR ".join("source LIKE ?" for _ in TYPABLE_SOURCES) + ")" if typable_only else ""
     with connect() as db:
         db.execute("BEGIN IMMEDIATE")
-        rows = db.execute("SELECT id, text FROM messages WHERE session_id=? AND delivered_at IS NULL ORDER BY id",
-                          (session_id,)).fetchall()
+        rows = db.execute("SELECT id, text FROM messages WHERE session_id=? AND delivered_at IS NULL" + where +
+                          " ORDER BY id", (session_id, *(TYPABLE_SOURCES if typable_only else ()))).fetchall()
         db.executemany("UPDATE messages SET delivered_at=? WHERE id=?", [(time.time(), r["id"]) for r in rows])
         db.execute("COMMIT")
         return [r["text"] for r in rows]
