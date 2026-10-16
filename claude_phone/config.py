@@ -40,6 +40,7 @@ class Settings:
     voicemail_ext: str = "500"
     allhands_ext: str = "9"
     operator_ext: str = "0"
+    safe_ext: str = "7233"  # Crack the Safe: S-A-F-E on the keypad
     operator_provider: str = "say"
     operator_voice: str = "Shelley (English (UK))"
     first_session_ext: int = 301  # not 1xx: UK 101 is the police, 111 the NHS

@@ -136,11 +136,17 @@ class Call:
         self.gone = ari.wait_for(lambda e: e.get("type") in ("StasisEnd", "ChannelDestroyed")
                                  and e.get("channel", {}).get("id") == channel_id)
         self.digits: asyncio.Queue[str] = asyncio.Queue()
+        self._last_dtmf: tuple | None = None
         ari.on_event(self._dtmf)
         self._n = 0
 
     def _dtmf(self, ev: dict) -> None:
         if ev.get("type") == "ChannelDtmfReceived" and ev.get("channel", {}).get("id") == self.id:
+            # The desk phone's endpoint subscription delivers each of its channel events a second time.
+            key = (ev.get("timestamp"), ev["digit"])
+            if key == self._last_dtmf:
+                return
+            self._last_dtmf = key
             self.digits.put_nowait(ev["digit"])
 
     def close(self) -> None:
@@ -151,6 +157,17 @@ class Call:
     @property
     def up(self) -> bool:
         return not self.gone.done()
+
+    async def next_digit(self, timeout: float) -> str | None:
+        """The next key pressed, or None after `timeout` seconds."""
+        task = asyncio.ensure_future(self.digits.get())
+        done, _ = await asyncio.wait({task, self.gone}, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+        if task in done:
+            return task.result()
+        task.cancel()
+        if self.gone in done:
+            raise Hangup()
+        return None
 
     def drain_digits(self) -> None:
         while not self.digits.empty():

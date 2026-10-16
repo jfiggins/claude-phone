@@ -38,6 +38,7 @@ are text to ElevenLabs, if you choose it, and missed-call pushes, if you set the
 | 201 | Linphone (testing) |
 | 0 | operator: say who you want ("the backend on the AGS branch") and it puts you through |
 | 9 | all-hands: your message is typed into every live session |
+| 7233 | Crack the Safe (S-A-F-E): find the 4-digit code in 8 tries; type 4 digits then #, the board shows after each guess while a guard heckles; Exit closes it to type the next one. Needs `screen_push` |
 | 500 | voicemail (T31P Message key) |
 | 600 | echo test |
 | 601 | 1 kHz tone |

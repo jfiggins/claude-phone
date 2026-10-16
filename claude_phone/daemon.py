@@ -13,7 +13,7 @@ from pathlib import Path
 
 from aiohttp import web
 
-from . import config, diary, hold, housekeeping, inject, keychain, log, push, registry, screen, stt, tts
+from . import config, diary, hold, housekeeping, inject, keychain, log, push, registry, safe, screen, stt, tts
 from .ari import ARI, Call, Hangup
 
 lg = log.get("daemon")
@@ -92,6 +92,7 @@ class Controller:
         self.line = asyncio.Lock()  # one call with the owner at a time
         self.calls: dict[str, asyncio.Task] = {}
         self.endpoint_state: dict[str, str] = {}
+        self.safe_play: dict | None = None  # the Crack the Safe call in progress: call, voice
         self.meeting: diary.Meeting | None = None  # the meeting in (or about to start) that holds calls
         self.window: set[str] = set()  # keys of the meetings in the current window
         self.released: set[str] = set()  # meetings whose hold was ended early with the DND key
@@ -255,6 +256,8 @@ class Controller:
                     await self.operator(call)
                 elif exten == self.s.allhands_ext:
                     await self.all_hands(call)
+                elif exten == self.s.safe_ext:
+                    await self.crack_the_safe(call)
                 elif exten.isdigit() and self.s.first_session_ext <= int(exten) <= self.s.last_session_ext:
                     await self.dial_session(call, int(exten))
                 else:
@@ -374,6 +377,75 @@ class Controller:
             watcher.cancel()
         lg.info("dial-in %s: off hold after %ds (%s)", sess.ext, time.monotonic() - started,
                 {"until": "turn ended", "#": "skipped"}.get(got, "timed out"))
+
+    async def crack_the_safe(self, call: Call) -> None:
+        """Dial 7233. Guesses are typed as keypad tones on the call: 4 digits then #, * deletes. The board is
+        pushed only after each guess: a pushed screen takes over the keypad, and redrawing it on every key
+        swallowed the digits (tested 2026-10-16). The phone's own entry screen doesn't show during a call."""
+        async def prerender() -> None:  # one at a time: parallel ElevenLabs requests get rate-limited
+            for x in safe.STATIC:
+                await tts.render_async(x)
+        asyncio.create_task(prerender())  # cached after the first game
+        self.safe_play = {"call": call, "voice": None}
+        try:
+            while True:
+                demo = safe.take_next_code()
+                game = safe.Game(demo)
+                lg.info("safe: new game%s", " (demo code)" if demo else "")
+                self.safe_say(safe.INTRO)
+                cur = ""
+                while not game.over:
+                    d = await call.next_digit(300)
+                    lg.info("safe: key %r", d)
+                    if d is None:
+                        return
+                    if d == "*":
+                        cur = cur[:-1]
+                    elif d.isdigit():
+                        cur = (cur + d)[-safe.DIGITS:]
+                    elif d == "#":
+                        line = game.guess(cur)
+                        cur = ""
+                        lg.info("safe: tries %s", game.tries)
+                        self.safe_say(line)
+                        if not game.over:
+                            await screen.push(self.safe_board(game), "safe board")
+                if game.won:
+                    new_best = not demo and safe.record(len(game.tries))  # a known code doesn't count
+                    lg.info("safe: cracked in %s tries%s", len(game.tries), " (best)" if new_best else "")
+                else:
+                    lg.info("safe: locked out")
+                await screen.push(self.safe_board(game), "safe board")
+                while (d := await call.next_digit(120)) not in ("#", None):
+                    pass
+                if d is None:
+                    return
+        finally:
+            lg.info("safe: call ended")
+            self.safe_play = None
+
+    def safe_say(self, text: str | None) -> None:
+        """The guard's line on the game's call, after any line still playing."""
+        play = self.safe_play
+        if not play or not text:
+            return
+        call, prev = play["call"], play["voice"]
+
+        async def go() -> None:
+            if prev:
+                await asyncio.gather(prev, return_exceptions=True)
+            try:
+                await call.play(await tts.render_async(text))
+            except Hangup:
+                pass
+        play["voice"] = asyncio.create_task(go())
+
+    def safe_board(self, game: safe.Game) -> str:
+        """Stays up until Exit, so earlier guesses can be studied; while it's up the keypad sends no tones."""
+        header, lines = game.board(safe.best())
+        if game.over:
+            lines = ["# to play again", *lines]
+        return screen.formatted_screen(header, lines, timeout=600, keys=[("Exit", "SoftKey:Exit")])
 
     async def all_hands(self, call: Call) -> None:
         """Dial 9: one message typed into every live session."""

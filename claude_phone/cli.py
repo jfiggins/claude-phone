@@ -297,6 +297,15 @@ def cmd_push(a) -> None:
           "Treat it like a password. Then run: phone push test")
 
 
+def cmd_safe_code(a) -> None:
+    from . import safe
+    try:
+        safe.set_next_code(a.code)
+    except ValueError as e:
+        raise SystemExit(f"code must be {e}")
+    print(f"The next Crack the Safe game uses {a.code}. Games after it are random again.")
+
+
 def cmd_meeting_test(a) -> None:
     req = urllib.request.Request(f"{config.load().daemon_url}/meeting-test", data=b"{}", method="POST")
     with urllib.request.urlopen(req, timeout=60) as r:
@@ -353,6 +362,9 @@ def main() -> None:
     sp = sub.add_parser("say", help="render text to speech, print the media URI")
     sp.add_argument("text")
     sp.set_defaults(fn=cmd_say)
+    sp = sub.add_parser("safe-code", help="fix the code of the next Crack the Safe game (for demos)")
+    sp.add_argument("code")
+    sp.set_defaults(fn=cmd_safe_code)
     sub.add_parser("meeting-test", help="preview a meeting alert (whisper and screen)").set_defaults(fn=cmd_meeting_test)
     sub.add_parser("meetings", help="upcoming meetings the alerts will use").set_defaults(fn=cmd_meetings)
     sub.add_parser("config", help="regenerate Asterisk config").set_defaults(fn=lambda a: render_asterisk_config())

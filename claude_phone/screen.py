@@ -20,6 +20,22 @@ def text_screen(title: str, text: str, timeout: int) -> str:
             f"<Title>{escape(title)}</Title><Text>{escape(text)}</Text></YealinkIPPhoneTextScreen>")
 
 
+def _softkeys(keys: list[tuple[str, str]]) -> str:
+    """(label, uri) pairs for soft keys 1-4. A uri of "SoftKey:Exit" closes the screen."""
+    return "".join(f'<SoftKey index="{i}"><Label>{escape(lb)}</Label><URI>{escape(u)}</URI></SoftKey>'
+                   for i, (lb, u) in enumerate(keys, 1) if lb)
+
+
+def formatted_screen(header: str, lines: list[str], timeout: int, keys: list[tuple[str, str]] = ()) -> str:
+    """A fixed header line, then lines that scroll with the arrow keys: the T31P fits about two below it.
+    While a pushed screen is up, the keypad works the screen and sends no digits down the line."""
+    body = "".join(f'<Line Size="small" Align="left">{escape(x)}</Line>' for x in lines)
+    return ('<?xml version="1.0" encoding="UTF-8"?>'
+            f'<YealinkIPPhoneFormattedTextScreen Beep="no" Timeout="{timeout}">'
+            f'<Line Size="small" Align="left">{escape(header)}</Line><Scroll>{body}</Scroll>'
+            f"{_softkeys(list(keys))}</YealinkIPPhoneFormattedTextScreen>")
+
+
 def desk_ip(s: config.Settings) -> str | None:
     """desk_ip from config, else the address the desk phone registered from."""
     if s.desk_ip:
@@ -34,6 +50,14 @@ def desk_ip(s: config.Settings) -> str | None:
 
 
 async def show(title: str, text: str, timeout: int = 120) -> bool:
+    return await _push(text_screen(title, text, timeout), title, text)
+
+
+async def push(xml: str, what: str) -> bool:
+    return await _push(xml, what, "")
+
+
+async def _push(xml: str, title: str, text: str) -> bool:
     s = config.load()
     if not s.screen_push:
         return False
@@ -44,7 +68,7 @@ async def show(title: str, text: str, timeout: int = 120) -> bool:
     conn = aiohttp.TCPConnector(ssl=False, local_addr=(s.lan_ip, 0))
     try:
         async with aiohttp.ClientSession(connector=conn) as http:
-            async with http.post(f"https://{ip}/servlet?push=xml", data=text_screen(title, text, timeout),
+            async with http.post(f"https://{ip}/servlet?push=xml", data=xml.encode(),
                                  headers={"Content-Type": "text/xml"}, timeout=aiohttp.ClientTimeout(total=8)) as r:
                 ok = r.status == 200
         lg.info("screen %s: %r %r", "shown" if ok else f"refused ({r.status})", title, text)
