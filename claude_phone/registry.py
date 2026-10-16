@@ -58,6 +58,13 @@ CREATE TABLE IF NOT EXISTS messages (
   created_at   REAL NOT NULL,
   delivered_at REAL
 );
+CREATE TABLE IF NOT EXISTS extensions (
+  ext         INTEGER PRIMARY KEY,  -- an extension freed by a session that ended, and who had it
+  released_at REAL NOT NULL,
+  host        TEXT,
+  pid         INTEGER,
+  iterm_id    TEXT
+);
 """
 
 
@@ -76,7 +83,8 @@ class Session:
     # A session on another computer: no iTerm tab, so its computer's name and its claude process instead.
     host: str | None = None
     pid: int | None = None
-    seen_at: float | None = None  # its last hook or heartbeat; it is dropped when these stop
+    seen_at: float | None = None  # its last hook or heartbeat
+    beat_at: float | None = None  # its MCP server's last heartbeat; when these stop, the session has gone
 
     @property
     def label(self) -> str:
@@ -119,7 +127,8 @@ def connect():
 def _migrate(db) -> None:
     """Columns added after the first release. CREATE TABLE IF NOT EXISTS leaves an existing table alone."""
     for table, column, kind in (("voicemails", "host", "TEXT"), ("sessions", "host", "TEXT"),
-                                ("sessions", "pid", "INTEGER"), ("sessions", "seen_at", "REAL")):
+                                ("sessions", "pid", "INTEGER"), ("sessions", "seen_at", "REAL"),
+                                ("sessions", "beat_at", "REAL")):
         if column not in {r[1] for r in db.execute(f"PRAGMA table_info({table})")}:
             try:
                 db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {kind}")
@@ -156,10 +165,11 @@ def register(session_id: str, repo: str, branch: str | None, worktree: str | Non
                            (session_id, prev["session_id"]))
         if ext is None:
             used = {r[0] for r in db.execute("SELECT ext FROM sessions")}
-            ext = next((e for e in range(s.first_session_ext, s.last_session_ext + 1) if e not in used), None)
-            if ext is None:
+            free = [e for e in range(s.first_session_ext, s.last_session_ext + 1) if e not in used]
+            if not free:
                 db.execute("ROLLBACK")
                 raise RuntimeError("no free extensions")
+            ext = _pick(db, free, iterm_id, host, pid)
         db.execute(
             """INSERT INTO sessions (session_id, ext, repo, branch, worktree, cwd, iterm_id, status, started_at, updated_at,
                                      host, pid, seen_at)
@@ -173,9 +183,30 @@ def register(session_id: str, repo: str, branch: str | None, worktree: str | Non
         return _session(db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,)).fetchone())
 
 
+def _pick(db, free: list[int], iterm_id: str | None, host: str | None, pid: int | None) -> int:
+    """A session coming back (dropped while it was quiet) gets its old extension if it's still free.
+    Otherwise the extension free the longest, never-used ones first: an extension you have just seen
+    on the phone shouldn't quietly reach a different session."""
+    released = {r["ext"]: r for r in db.execute("SELECT * FROM extensions")}
+    for e in free:
+        r = released.get(e)
+        if r and ((iterm_id and r["iterm_id"] == iterm_id) or (host and pid and (r["host"], r["pid"]) == (host, pid))):
+            return e
+    return min(free, key=lambda e: (released[e]["released_at"] if e in released else 0, e))
+
+
+def _drop(db, sessions: list[Session]) -> None:
+    """Delete sessions, remembering who had each extension and when it was freed (see _pick)."""
+    now = time.time()
+    for x in sessions:
+        db.execute("DELETE FROM sessions WHERE session_id=?", (x.session_id,))
+        db.execute("INSERT OR REPLACE INTO extensions (ext, released_at, host, pid, iterm_id) VALUES (?,?,?,?,?)",
+                   (x.ext, now, x.host, x.pid, x.iterm_id))
+
+
 def unregister(session_id: str) -> None:
     with connect() as db:
-        db.execute("DELETE FROM sessions WHERE session_id=?", (session_id,))
+        _drop(db, [_session(r) for r in db.execute("SELECT * FROM sessions WHERE session_id=?", (session_id,))])
 
 
 def set_status(session_id: str, status: str) -> None:
@@ -210,32 +241,36 @@ def remove_missing(live_iterm_ids: set[str]) -> list[Session]:
     """Drop sessions whose iTerm session no longer exists. Returns the removed rows."""
     gone = [s for s in all_sessions() if s.iterm_id and s.iterm_id not in live_iterm_ids]
     with connect() as db:
-        for s in gone:
-            db.execute("DELETE FROM sessions WHERE session_id=?", (s.session_id,))
+        _drop(db, gone)
     return gone
 
 
 # --- sessions on another computer ---
 
-def seen(host: str, pid: int | None, session_id: str | None, status: str | None = None) -> int:
+def seen(host: str, pid: int | None, session_id: str | None, status: str | None = None, beat: bool = False) -> int:
     """A hook or heartbeat from another computer: the session is still open. Matched by its claude process
     as well as its id, since the MCP server's heartbeat keeps the first session id after /clear.
     Returns how many sessions it matched."""
     now = time.time()
     with connect() as db:
         cur = db.execute(
-            "UPDATE sessions SET seen_at=?, status=COALESCE(?, status), updated_at=?"
+            "UPDATE sessions SET seen_at=?, status=COALESCE(?, status), updated_at=?,"
+            " beat_at=CASE WHEN ? THEN ? ELSE beat_at END"
             " WHERE host=? AND (session_id=? OR (? IS NOT NULL AND pid=?))",
-            (now, status, now, host, session_id, pid, pid))
+            (now, status, now, beat, now, host, session_id, pid, pid))
         return cur.rowcount
 
 
-def expire_remote(cutoff: float) -> list[Session]:
-    """Drop sessions on other computers not heard from since cutoff (closed without a SessionEnd)."""
+def expire_remote(cutoff: float, idle_cutoff: float) -> list[Session]:
+    """Drop sessions on other computers that closed without a SessionEnd: ones whose MCP server sent
+    heartbeats and has fallen silent since cutoff. One that never sent any (an MCP server from before
+    heartbeats, or none) can sit idle for hours, so it goes only when not heard from since idle_cutoff."""
     with connect() as db:
         gone = [_session(r) for r in db.execute(
-            "SELECT * FROM sessions WHERE host IS NOT NULL AND COALESCE(seen_at, updated_at) < ?", (cutoff,))]
-        db.executemany("DELETE FROM sessions WHERE session_id=?", [(s.session_id,) for s in gone])
+            "SELECT * FROM sessions WHERE host IS NOT NULL AND CASE WHEN beat_at IS NOT NULL"
+            " THEN MAX(beat_at, COALESCE(seen_at, 0)) < ? ELSE COALESCE(seen_at, updated_at) < ? END",
+            (cutoff, idle_cutoff))]
+        _drop(db, gone)
     return gone
 
 

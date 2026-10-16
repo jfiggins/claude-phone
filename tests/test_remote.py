@@ -119,6 +119,7 @@ def client_install(monkeypatch):
     monkeypatch.setattr(hooks, "repo_info", lambda cwd: ("teamfiggins", "main", None))
     monkeypatch.setattr(remote.socket, "gethostname", lambda: "DESKTOP")
     monkeypatch.setenv("CLAUDE_PID", "4242")
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ATTENDED", "1")  # the suite may itself run under claude -p
     return calls
 
 
@@ -149,6 +150,15 @@ def test_client_session_start_and_end_tell_the_mac(client_install, monkeypatch, 
     _hook(monkeypatch, capsys, "session-end", {"session_id": "w1", "reason": "logout"})
     assert client_install == [("/session", {"session_id": "w1", **FIELDS}),
                               ("/session", {"session_id": "w1", "ended": True})]
+
+
+def test_client_headless_run_is_never_listed_but_still_collects(client_install, monkeypatch, capsys):
+    monkeypatch.setenv("CLAUDE_CODE_SESSION_ATTENDED", "0")  # claude -p, the SDK
+    _hook(monkeypatch, capsys, "session-start", {"session_id": "w1"})
+    out = _hook(monkeypatch, capsys, "stop", {"session_id": "w1"})
+    _hook(monkeypatch, capsys, "session-end", {"session_id": "w1", "reason": "other"})
+    assert client_install == [("/answers", {"session_id": "w1", "status": "idle"})]
+    assert json.loads(out)["decision"] == "block"
 
 
 def test_client_hook_survives_the_mac_being_away(client_install, monkeypatch, capsys):

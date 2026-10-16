@@ -30,7 +30,10 @@ ANSWER_PREFIX = "[Phone answer to your earlier question]"
 ALLHANDS_PREFIX = "[All-hands message from {owner}, sent to every session]"
 # A dial-in reaches a session on another computer through its hooks, not as typed text, so say who it's from.
 MESSAGE_PREFIX = "[Phone message from {owner}]"
-REMOTE_TTL = 300  # seconds without a hook or heartbeat before a session on another computer is dropped
+# A session on another computer is dropped this long after its MCP server's heartbeats stop, or, if it never
+# sent any (its MCP server predates them), after this long with no hook at all.
+REMOTE_TTL = 300
+REMOTE_IDLE_TTL = 12 * 3600
 # Claude Code's spinner line while a turn runs, e.g. "· Generating… (1m 51s · ↓ 4.3k tokens)".
 SPINNER = re.compile(r"…\s*\(\d+[hms]|esc to interrupt")
 HOLD_MAX = 600  # seconds on hold before the message is taken anyway
@@ -203,7 +206,8 @@ class Controller:
             except Exception as e:
                 lg.warning("stale sweep failed: %r", e)
             try:
-                for s in registry.expire_remote(time.time() - REMOTE_TTL):
+                now = time.time()
+                for s in registry.expire_remote(now - REMOTE_TTL, now - REMOTE_IDLE_TTL):
                     lg.info("removed silent session ext=%s %s on %s", s.ext, s.label, s.host)
             except Exception as e:
                 lg.warning("remote sweep failed: %r", e)
@@ -918,7 +922,7 @@ class Controller:
         """A remote session's MCP server, every minute: the session is still open."""
         body = await self.body(request)
         pid = body.get("pid") if isinstance(body.get("pid"), int) else None
-        n = registry.seen(body["host"], pid, body.get("session_id")) if body.get("host") else 0
+        n = registry.seen(body["host"], pid, body.get("session_id"), beat=True) if body.get("host") else 0
         return web.json_response({"ok": True, "known": bool(n)})
 
     async def http_answers(self, request: web.Request) -> web.Response:

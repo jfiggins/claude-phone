@@ -46,18 +46,23 @@ def remote_hook(event: str, sid: str, payload: dict) -> int:
     from . import remote
     lg = log.get("hook")
     cwd = payload.get("cwd") or os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
+    # `claude -p` and SDK runs (CLAUDE_CODE_SESSION_ATTENDED=0) have nobody to talk to: never listed, but
+    # they still collect a voicemail answer to a question they asked.
+    listed = os.environ.get("CLAUDE_CODE_SESSION_ATTENDED") != "0"
     if event == "session-start":
-        res = remote.request("/session", {"session_id": sid, **remote.caller_fields(cwd)})
-        lg.info("session start ext=%s sid=%s source=%s", res.get("ext"), sid, payload.get("source"))
+        if listed:
+            res = remote.request("/session", {"session_id": sid, **remote.caller_fields(cwd)})
+            lg.info("session start ext=%s sid=%s source=%s", res.get("ext"), sid, payload.get("source"))
         return 0
     if event == "session-end":
-        if payload.get("reason") != "clear":  # after /clear the next SessionStart takes over the extension
+        if listed and payload.get("reason") != "clear":  # after /clear the next SessionStart takes the extension
             remote.request("/session", {"session_id": sid, "ended": True})
         return 0
     status = "working" if event == "prompt" else "idle"
     # The repo fields let the Mac register a session it doesn't know (started before the hooks, or while
     # the Mac was away), so every turn keeps the phone's list right.
-    res = remote.request("/answers", {"session_id": sid, "status": status, **remote.caller_fields(cwd)})
+    fields = remote.caller_fields(cwd) if listed else {}
+    res = remote.request("/answers", {"session_id": sid, "status": status, **fields})
     answers = res.get("answers") or []
     if not answers:
         return 0

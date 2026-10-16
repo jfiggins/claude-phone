@@ -98,18 +98,57 @@ def test_clear_keeps_the_extension_and_what_is_waiting(ctl, monkeypatch):
     assert res["answers"] == ['[Phone answer to your earlier question] Yes. (Your question was: "Ship?")', "Waiting."]
 
 
-def test_silent_sessions_are_dropped_and_heartbeats_keep_them(ctl, monkeypatch):
+def _expire(at):
+    return [s.session_id for s in registry.expire_remote(at - daemon.REMOTE_TTL, at - daemon.REMOTE_IDLE_TTL)]
+
+
+def test_a_session_whose_heartbeats_stop_is_dropped(ctl, monkeypatch):
     app = _listener(ctl, monkeypatch)
+    now = time.time()
+    clock = [now]
+    monkeypatch.setattr(registry.time, "time", lambda: clock[0])
     _post(app, "/session", PC, "s3cret")
     _post(app, "/session", {**PC, "session_id": "w9", "pid": 99}, "s3cret")
     registry.register("m", "site-be-v2", "main", None, "/r", "tab")
-    later = time.time() + daemon.REMOTE_TTL + 1
-    monkeypatch.setattr(registry.time, "time", lambda: later)
+    _post(app, "/heartbeat", {"session_id": "w9", "host": "DESKTOP", "pid": 99}, "s3cret")
+    clock[0] = now + daemon.REMOTE_TTL + 1
     # The MCP server still beats with the first session id after /clear; its claude process matches.
     assert _post(app, "/heartbeat", {"session_id": "old", "host": "DESKTOP", "pid": 4242}, "s3cret")[1]["known"]
-    gone = registry.expire_remote(later - daemon.REMOTE_TTL)
-    assert [s.session_id for s in gone] == ["w9"]
+    assert _expire(clock[0]) == ["w9"]  # its beats stopped: closed without a SessionEnd
     assert {s.session_id for s in registry.all_sessions()} == {"w1", "m"}  # Mac sessions never expire this way
+
+
+def test_a_session_that_never_beat_survives_a_long_idle(ctl, monkeypatch):
+    """Its MCP server predates heartbeats (2026-10-16: an idle session was dropped after 5 minutes)."""
+    app = _listener(ctl, monkeypatch)
+    now = time.time()
+    _post(app, "/session", PC, "s3cret")
+    assert _expire(now + 3 * 3600) == []
+    assert _expire(now + daemon.REMOTE_IDLE_TTL + 1) == ["w1"]
+
+
+def test_a_dropped_session_gets_its_extension_back(ctl, monkeypatch):
+    app = _listener(ctl, monkeypatch)
+    _post(app, "/session", PC, "s3cret")                                       # 301
+    _post(app, "/session", {**PC, "session_id": "w2", "pid": 77}, "s3cret")    # 302
+    registry.unregister("w1")
+    _post(app, "/session", {**PC, "session_id": "w3", "pid": 88}, "s3cret")    # new: not 301
+    _post(app, "/session", PC, "s3cret")                                       # w1 is back
+    assert {s.session_id: s.ext for s in registry.all_sessions()} == {"w1": 301, "w2": 302, "w3": 303}
+
+
+def test_a_freed_extension_is_the_last_to_be_reused(monkeypatch):
+    """2026-10-16: 302 was freed and handed to another session at once, so a dial-in reached the wrong one."""
+    s = config.load()
+    s.last_session_ext = 303  # three extensions: 301-303
+    monkeypatch.setattr(config, "load", lambda: s)
+    registry.register("a", "r", "main", None, None, None, host="PC", pid=1)   # 301
+    registry.register("b", "r", "main", None, None, None, host="PC", pid=2)   # 302
+    registry.unregister("b")
+    registry.register("c", "r", "main", None, None, None, host="PC", pid=3)   # 303, never used, before 302
+    registry.unregister("a")
+    registry.register("d", "r", "main", None, None, None, host="PC", pid=4)   # 302: freed before 301
+    assert {s.session_id: s.ext for s in registry.all_sessions()} == {"c": 303, "d": 302}
 
 
 def test_its_calls_show_its_extension_as_caller_id(ctl):

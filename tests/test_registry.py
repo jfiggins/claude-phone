@@ -1,12 +1,13 @@
 from claude_phone import registry
 
 
-def test_lowest_free_extension():
+def test_lowest_never_used_extension_and_a_freed_one_comes_back_to_its_tab():
     a = registry.register("a", "repo-a", "main", None, "/a", "tab-a")
     b = registry.register("b", "repo-b", "main", None, "/b", "tab-b")
     assert (a.ext, b.ext) == (301, 302)
     registry.unregister("a")
-    assert registry.register("c", "repo-c", "main", None, "/c", "tab-c").ext == 301
+    assert registry.register("c", "repo-c", "main", None, "/c", "tab-c").ext == 303  # 301 was just in use
+    assert registry.register("a2", "repo-a", "main", None, "/a", "tab-a").ext == 301  # its tab is back
 
 
 def test_new_session_in_same_tab_takes_extension_and_voicemail():

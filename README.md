@@ -163,8 +163,11 @@ Then add four hooks to `~/.claude/settings.json`, each running `<full path>/phon
 (`stop`). The first two put the session on the Mac's list and take it off. The other two keep it there
 (registering it if the Mac missed its start) and collect what is waiting for it: voicemail answers and
 messages you dialled in. One collected when a turn ends keeps Claude going with it; one collected when you
-type is added to that turn. The MCP server tells the Mac every minute that its session is still open, and
-the Mac drops a session it hasn't heard from for five minutes (a terminal closed without `SessionEnd`).
+type is added to that turn. The MCP server tells the Mac every minute that its session is still open; the
+Mac drops a session five minutes after those heartbeats stop (a terminal closed without `SessionEnd`), or,
+for a session whose MCP server sends none, after 12 hours without a hook. `claude -p` and SDK runs are never
+listed. Extensions stay put: a session that comes back gets its old one, and a freed extension is the last
+to be handed out again, so a number on the phone's screen doesn't quietly reach a different session.
 Add [docs/claude-md-snippet.md](docs/claude-md-snippet.md) to `~/.claude/CLAUDE.md` as on the Mac.
 
 The traffic is plain HTTP with a bearer token: fine on a home LAN or a Tailscale network, not across the internet.
