@@ -22,17 +22,26 @@ def headers() -> dict:
 
 
 def claude_pid() -> int | None:
-    """The claude process this hook or MCP server belongs to. Claude Code sets CLAUDE_PID for both, and
-    it outlives /clear, so it identifies the session's terminal the way the iTerm tab does on the Mac."""
+    """The claude process a hook belongs to. It outlives /clear, so it identifies the session's terminal the
+    way the iTerm tab does on the Mac. Claude Code sets CLAUDE_PID for hooks but not for MCP servers, which
+    inherit it from whatever started claude: nothing from a terminal, and from inside another session, that
+    session's (tested 2026-10-16). An MCP server uses mcp_claude_pid instead."""
     v = os.environ.get("CLAUDE_PID")
     return int(v) if v and v.isdigit() else None
 
 
-def caller_fields(cwd: str) -> dict:
+def mcp_claude_pid() -> int | None:
+    """The claude process an MCP server belongs to: its nearest claude ancestor (Windows), else None."""
+    from . import console
+    return console.nearest_claude(os.getpid(), console.processes())
+
+
+def caller_fields(cwd: str, pid: int | None = None) -> dict:
     """What the daemon can't work out for itself: it has no access to this computer's repos."""
     from .hooks import repo_info
     repo, branch, worktree = repo_info(cwd)
-    return {"repo": repo, "branch": branch, "worktree": worktree, "host": socket.gethostname(), "pid": claude_pid()}
+    return {"repo": repo, "branch": branch, "worktree": worktree, "host": socket.gethostname(),
+            "pid": pid or claude_pid()}
 
 
 def poll_once(body: dict) -> int:
@@ -58,9 +67,9 @@ def start_heartbeat() -> None:
     """From the MCP server, which lives exactly as long as its session: tell the Mac every few seconds that
     the session is still open (the Mac drops it a few minutes after these stop: a terminal closed without a
     SessionEnd hook), and type in what was dialled in while it sat idle. Typing needs Windows and the claude
-    process's id; without them the session still gets its messages from its hooks."""
+    process found among its ancestors; without them the session still gets its messages from its hooks."""
     from . import console
-    pid = claude_pid()
+    pid = mcp_claude_pid()
     body = {"session_id": os.environ.get("CLAUDE_CODE_SESSION_ID"), "host": socket.gethostname(),
             "pid": pid or os.getppid(), "can_type": bool(pid) and console.available()}
 

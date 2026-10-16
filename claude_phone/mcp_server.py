@@ -19,7 +19,7 @@ def _body(**kw) -> dict:
     cwd = os.environ.get("CLAUDE_PROJECT_DIR") or os.getcwd()
     body = {**kw, "session_id": os.environ.get("CLAUDE_CODE_SESSION_ID"), "iterm_id": iterm_unique_id(), "cwd": cwd}
     if config.load().remote_url:
-        body.update(remote.caller_fields(cwd))
+        body.update(remote.caller_fields(cwd, pid=remote.mcp_claude_pid() or os.getppid()))
     return body
 
 

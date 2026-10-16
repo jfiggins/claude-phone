@@ -120,3 +120,18 @@ def test_the_mcp_server_hands_back_what_it_could_not_type(mac, monkeypatch):
 def test_each_key_is_pressed_and_released():
     assert console.key_events("ab") == [(True, "a", 0), (False, "a", 0), (True, "b", 0), (False, "b", 0)]
     assert console.key_events("\r", console.VK_RETURN) == [(True, "\r", 13), (False, "\r", 13)]
+
+
+def test_the_mcp_server_finds_its_own_claude_through_launchers():
+    """Claude Code doesn't set CLAUDE_PID for MCP servers (2026-10-16): they walk up to the nearest claude."""
+    table = {
+        50: (40, "python.exe"),         # the MCP server
+        40: (30, "python.exe"),         # the venv's python.exe starts the real one
+        30: (20, "phone.exe"),          # the console-script launcher
+        20: (10, "claude.exe.old.123"), # its session, renamed by an auto-update
+        10: (5, "WindowsTerminal.exe"),
+    }
+    assert console.nearest_claude(50, table) == 20
+    nested = {**table, 10: (5, "claude.exe")}  # started from inside another session: still its own
+    assert console.nearest_claude(50, nested) == 20
+    assert console.nearest_claude(50, {50: (40, "python.exe"), 40: (1, "explorer.exe")}) is None

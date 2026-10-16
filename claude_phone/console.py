@@ -16,6 +16,52 @@ def available() -> bool:
     return sys.platform == "win32"
 
 
+def processes() -> dict[int, tuple[int, str]]:
+    """pid -> (parent pid, executable name) for every process (Windows), or {} where it can't be read."""
+    if sys.platform != "win32":
+        return {}
+    import ctypes
+    from ctypes import wintypes
+
+    class PROCESSENTRY32W(ctypes.Structure):
+        _fields_ = [("dwSize", wintypes.DWORD), ("cntUsage", wintypes.DWORD), ("th32ProcessID", wintypes.DWORD),
+                    ("th32DefaultHeapID", ctypes.c_void_p), ("th32ModuleID", wintypes.DWORD),
+                    ("cntThreads", wintypes.DWORD), ("th32ParentProcessID", wintypes.DWORD),
+                    ("pcPriClassBase", ctypes.c_long), ("dwFlags", wintypes.DWORD), ("szExeFile", wintypes.WCHAR * 260)]
+
+    k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+    k32.CreateToolhelp32Snapshot.restype = wintypes.HANDLE
+    snap = k32.CreateToolhelp32Snapshot(0x2, 0)  # TH32CS_SNAPPROCESS
+    if snap in (None, wintypes.HANDLE(-1).value):
+        return {}
+    out = {}
+    try:
+        e = PROCESSENTRY32W()
+        e.dwSize = ctypes.sizeof(e)
+        ok = k32.Process32FirstW(snap, ctypes.byref(e))
+        while ok:
+            out[e.th32ProcessID] = (e.th32ParentProcessID, e.szExeFile)
+            ok = k32.Process32NextW(snap, ctypes.byref(e))
+    finally:
+        k32.CloseHandle(snap)
+    return out
+
+
+def nearest_claude(pid: int, table: dict[int, tuple[int, str]], depth: int = 6) -> int | None:
+    """The closest ancestor of pid that is claude. Launchers sit between (phone.exe and the venv's python.exe
+    each start the real program as a child), and a session that auto-updated runs as 'claude.exe.old.<n>'.
+    The nearest one, so a claude started inside another session's terminal finds its own console."""
+    for _ in range(depth):
+        parent = table.get(pid)
+        if not parent:
+            return None
+        pid = parent[0]
+        name = (table.get(pid, (0, ""))[1] or "").lower()
+        if name == "claude" or name.startswith("claude.exe"):
+            return pid
+    return None
+
+
 def _api():
     import ctypes
     from ctypes import wintypes
